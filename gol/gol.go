@@ -31,6 +31,8 @@ type SectionResponse struct {
 	Section [][]byte
 }
 
+type Empty struct{}
+
 /*
 *** Step 1 ***
 - reads the initial PGM through the IO goroutine (via channels)

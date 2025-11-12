@@ -10,8 +10,11 @@ import (
 )
 
 // the broker will keep track of the multiple GOLWorkers
+// can use to tell us how many workers we have and then split up the image based on that
 type Broker struct {
 	workerAddresses []string
+	turn            int
+	alive           int
 }
 
 type section struct {
@@ -51,8 +54,22 @@ func assignSections(height, workers int) []section {
 	return sections
 }
 
+// function to count the number of alive cells
+func countAlive(world [][]byte) int {
+	count := 0
+	for y := range world {
+		for x := range world[y] {
+			if world[y][x] == 255 {
+				count++
+			}
+		}
+	}
+
+	return count
+}
+
 // one iteration of the game using all workers
-func (broker *Broker) ProcessTurn(req gol.BrokerRequest, res *gol.BrokerResponse) error {
+func (broker *Broker) ProcessSection(req gol.BrokerRequest, res *gol.BrokerResponse) error {
 	p := req.Params
 	world := req.World
 
@@ -60,7 +77,7 @@ func (broker *Broker) ProcessTurn(req gol.BrokerRequest, res *gol.BrokerResponse
 
 	// throw an error in teh case of there not being any workers dialled
 	if numWorkers == 0 {
-		return fmt.Errorf("no workers dialled")
+		return fmt.Errorf("no workers registered")
 	}
 
 	// assign different sections of the image to each worker (aws node)
@@ -76,8 +93,8 @@ func (broker *Broker) ProcessTurn(req gol.BrokerRequest, res *gol.BrokerResponse
 
 	// for each worker, assign the sections
 	for i, address := range broker.workerAddresses {
-		i, address := i, address
 		section := sections[i]
+		address := address
 
 		// process for each worker
 		go func() {
@@ -99,7 +116,8 @@ func (broker *Broker) ProcessTurn(req gol.BrokerRequest, res *gol.BrokerResponse
 			}
 
 			var sectionRes gol.SectionResponse
-			if err := client.Call("GOLWorker.ProcessTurn", sectionReq, &sectionRes); err != nil {
+
+			if err := client.Call("GOLWorker.ProcessSection", sectionReq, &sectionRes); err != nil {
 				resultsChan <- sectionResult{err: fmt.Errorf("dial %s: %w", address, err)}
 				return
 			}
@@ -128,7 +146,38 @@ func (broker *Broker) ProcessTurn(req gol.BrokerRequest, res *gol.BrokerResponse
 		}
 	}
 
+	broker.turn++
+	broker.alive = countAlive(newWorld)
+
 	res.World = newWorld
+	return nil
+}
+
+func (broker *Broker) GetAliveCount(_ struct{}, out *int) error {
+	*out = broker.alive
+	return nil
+}
+
+// We need a function that when q (quit) is pressed then the controller
+// exit without killing the simulation
+// when q is pressed we need to save the current board (pgm), then call a function that
+// doesnt persist the world -> basically do nothing
+func (broker *Broker) ControllerExit(_ gol.Empty, _ *gol.Empty) error {
+	return nil
+}
+
+// when k is pressed, we need to call a function that would send GOL.Shutdown
+// to each worker and then kill itself
+// then the controller saves the final image and exits
+func (broker *Broker) KillWorkers(_ gol.Empty, _ *gol.Empty) error {
+	for _, address := range broker.workerAddresses {
+		if c, err := rpc.Dial("tcp", address); err == nil {
+			_ = c.Call("GOLWorker.Shutdown", struct{}{}, nil)
+			_ = c.Close()
+		}
+	}
+
+	go os.Exit(0)
 	return nil
 }
 
@@ -154,7 +203,7 @@ func main() {
 		os.Exit(1)
 		return
 	}
-	fmt.Println("Worker listening on port 8040 (IPv4)...")
+	fmt.Println("Broker listening on port 8040 (IPv4)...")
 
 	defer listener.Close()
 

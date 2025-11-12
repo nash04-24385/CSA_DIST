@@ -185,7 +185,7 @@ func main() {
 
 	broker := &Broker{
 		workerAddresses: []string{
-			"54.209.189.255:8030",
+			"3.91.156.154:8030",
 		},
 	}
 

@@ -1,125 +1,230 @@
 package main
 
 import (
+	"encoding/gob"
 	"fmt"
 	"net"
 	"net/rpc"
 	"os"
+	"time"
 
 	"uk.ac.bris.cs/gameoflife/gol"
 )
 
+// ------------------------------------------------------------
+// Worker struct and setup
+// ------------------------------------------------------------
+
 type GOLWorker struct {
+	Neigh   gol.Neighbours // up/down neighbour info
+	Section [][]byte       // worker’s own part of the world
+	StartY  int            // start index (for reconstruction)
+	EndY    int
+	Params  gol.Params
 }
 
-// process the section the broker gives
-func (e *GOLWorker) ProcessSection(req gol.SectionRequest, res *gol.SectionResponse) error {
-	p := req.Params
-	world := req.World
-	startY := req.StartY
-	endY := req.EndY
+// ------------------------------------------------------------
+// RPC: Set neighbour information (called by broker)
+// ------------------------------------------------------------
 
-	// call calculate state function on the requested section
-	updatedSection := calculateNextStates(p, world, startY, endY)
-
-	// update response to give back to broker
-	res.StartY = startY
-	res.Section = updatedSection
+func (w *GOLWorker) SetupNeighbours(neigh gol.Neighbours, _ *struct{}) error {
+	w.Neigh = neigh
+	fmt.Println("Neighbours set → Up:", neigh.UpAddr, " Down:", neigh.DownAddr)
 	return nil
 }
 
-// helper func to make worker shut down on keypress
-func (e *GOLWorker) Shutdown(_ struct{}, _ *struct{}) error {
-	fmt.Println("shutdown signal recieved, stopping worker.")
+// ------------------------------------------------------------
+// RPC: Start simulation (called by broker)
+// ------------------------------------------------------------
 
+func (w *GOLWorker) StartSimulation(p gol.Params, _ *struct{}) error {
+	w.Params = p
+
+	fmt.Printf("Worker starting Halo Exchange simulation (%d turns)...\n", p.Turns)
+
+	go w.runHaloSimulation()
+
+	return nil
+}
+
+// ------------------------------------------------------------
+// Halo Exchange core logic
+// ------------------------------------------------------------
+
+type HaloMsg struct {
+	Row []byte
+}
+
+// Sends top/bottom rows to neighbours and receives halos
+func (w *GOLWorker) exchangeHalos(topRow, bottomRow []byte) ([]byte, []byte) {
+	upHaloCh := make(chan []byte, 1)
+	downHaloCh := make(chan []byte, 1)
+
+	// Send to UP neighbour, receive bottom halo from it
+	go func() {
+		conn, err := net.Dial("tcp", w.Neigh.UpAddr)
+		if err != nil {
+			fmt.Println("Dial error (up):", err)
+			upHaloCh <- make([]byte, len(topRow))
+			return
+		}
+		defer conn.Close()
+
+		enc := gob.NewEncoder(conn)
+		dec := gob.NewDecoder(conn)
+
+		_ = enc.Encode(HaloMsg{Row: topRow})
+		var reply HaloMsg
+		_ = dec.Decode(&reply)
+		upHaloCh <- reply.Row
+	}()
+
+	// Send to DOWN neighbour, receive top halo from it
+	go func() {
+		conn, err := net.Dial("tcp", w.Neigh.DownAddr)
+		if err != nil {
+			fmt.Println("Dial error (down):", err)
+			downHaloCh <- make([]byte, len(bottomRow))
+			return
+		}
+		defer conn.Close()
+
+		enc := gob.NewEncoder(conn)
+		dec := gob.NewDecoder(conn)
+
+		_ = enc.Encode(HaloMsg{Row: bottomRow})
+		var reply HaloMsg
+		_ = dec.Decode(&reply)
+		downHaloCh <- reply.Row
+	}()
+
+	upHalo := <-upHaloCh
+	downHalo := <-downHaloCh
+	return upHalo, downHalo
+}
+
+// ------------------------------------------------------------
+// Main simulation loop
+// ------------------------------------------------------------
+
+func (w *GOLWorker) runHaloSimulation() {
+	h := w.Params.ImageHeight
+	wid := w.Params.ImageWidth
+	turns := w.Params.Turns
+
+	for turn := 0; turn < turns; turn++ {
+		topRow := w.Section[0]
+		bottomRow := w.Section[len(w.Section)-1]
+
+		// Exchange halos with neighbours
+		upHalo, downHalo := w.exchangeHalos(topRow, bottomRow)
+
+		// Compute new state with halos
+		newSection := w.calculateNextStatesWithHalo(h, wid, upHalo, downHalo)
+
+		w.Section = newSection
+
+		if turn%50 == 0 || turn == turns-1 {
+			fmt.Printf("Worker (%d-%d) completed turn %d\n", w.StartY, w.EndY, turn)
+		}
+		time.Sleep(1 * time.Millisecond) // optional throttle for debugging
+	}
+
+	fmt.Printf("Worker (%d-%d) finished all %d turns.\n", w.StartY, w.EndY, turns)
+}
+
+// ------------------------------------------------------------
+// Compute next state using halo rows
+// ------------------------------------------------------------
+
+func (w *GOLWorker) calculateNextStatesWithHalo(h, wdt int, upHalo, downHalo []byte) [][]byte {
+	rows := len(w.Section)
+	newRows := make([][]byte, rows)
+
+	for i := 0; i < rows; i++ {
+		newRows[i] = make([]byte, wdt)
+		for j := 0; j < wdt; j++ {
+			count := 0
+
+			upIndex := i - 1
+			downIndex := i + 1
+
+			// get neighbour rows safely (using halos if on boundary)
+			var upRow, downRow []byte
+			if upIndex < 0 {
+				upRow = upHalo
+			} else {
+				upRow = w.Section[upIndex]
+			}
+
+			if downIndex >= rows {
+				downRow = downHalo
+			} else {
+				downRow = w.Section[downIndex]
+			}
+
+			left := (j - 1 + wdt) % wdt
+			right := (j + 1) % wdt
+
+			// count 8 neighbours
+			neighbours := []byte{
+				upRow[left], upRow[j], upRow[right],
+				w.Section[i][left], w.Section[i][right],
+				downRow[left], downRow[j], downRow[right],
+			}
+
+			for _, cell := range neighbours {
+				if cell == 255 {
+					count++
+				}
+			}
+
+			// update cell
+			if w.Section[i][j] == 255 {
+				if count == 2 || count == 3 {
+					newRows[i][j] = 255
+				} else {
+					newRows[i][j] = 0
+				}
+			} else {
+				if count == 3 {
+					newRows[i][j] = 255
+				} else {
+					newRows[i][j] = 0
+				}
+			}
+		}
+	}
+	return newRows
+}
+
+// ------------------------------------------------------------
+// RPC: Return final section (for broker collection)
+// ------------------------------------------------------------
+
+func (w *GOLWorker) GetSection(_ struct{}, out *[][]byte) error {
+	*out = w.Section
+	return nil
+}
+
+// ------------------------------------------------------------
+// RPC: Shutdown (unchanged)
+// ------------------------------------------------------------
+
+func (w *GOLWorker) Shutdown(_ struct{}, _ *struct{}) error {
+	fmt.Println("Shutdown signal received. Exiting worker...")
 	go func() {
 		os.Exit(0)
 	}()
 	return nil
 }
 
-func calculateNextStates(p gol.Params, world [][]byte, startY, endY int) [][]byte {
-	h := p.ImageHeight //h rows
-	w := p.ImageWidth  //w columns
-
-	rows := endY - startY
-
-	//make new grid section
-	newRows := make([][]byte, rows)
-	for i := 0; i < rows; i++ {
-		newRows[i] = make([]byte, w)
-	}
-
-	for i := startY; i < endY; i++ {
-		for j := 0; j < w; j++ { //accessing each individual cell
-			count := 0
-			up := (i - 1 + h) % h
-			down := (i + 1) % h
-			left := (j - 1 + w) % w
-			right := (j + 1) % w
-
-			//need to check all it's neighbors and state of it's cell
-			leftCell := world[i][left]
-			if leftCell == 255 {
-				count += 1
-			}
-			rightCell := world[i][right]
-			if rightCell == 255 {
-				count += 1
-			}
-			upCell := world[up][j]
-			if upCell == 255 {
-				count += 1
-			}
-			downCell := world[down][j]
-			if downCell == 255 {
-				count += 1
-			}
-			upRightCell := world[up][right]
-			if upRightCell == 255 {
-				count += 1
-			}
-			upLeftCell := world[up][left]
-			if upLeftCell == 255 {
-				count += 1
-			}
-
-			downRightCell := world[down][right]
-			if downRightCell == 255 {
-				count += 1
-			}
-
-			downLeftCell := world[down][left]
-			if downLeftCell == 255 {
-				count += 1
-			}
-
-			//update the cells
-			if world[i][j] == 255 {
-				if count == 2 || count == 3 {
-					newRows[i-startY][j] = 255
-				} else {
-					newRows[i-startY][j] = 0
-				}
-			}
-
-			if world[i][j] == 0 {
-				if count == 3 {
-					newRows[i-startY][j] = 255
-				} else {
-					newRows[i-startY][j] = 0
-				}
-			}
-
-		}
-	}
-	return newRows
-}
+// ------------------------------------------------------------
+// Main (unchanged except log)
+// ------------------------------------------------------------
 
 func main() {
-
 	err := rpc.RegisterName("GOLWorker", new(GOLWorker))
-
 	if err != nil {
 		fmt.Println("Error registering RPC:", err)
 		return
@@ -134,7 +239,6 @@ func main() {
 	fmt.Println("Worker listening on port 8030 (IPv4)...")
 
 	defer listener.Close()
-
 	for {
 		conn, err := listener.Accept()
 		if err != nil {

@@ -28,7 +28,7 @@ func distributor(p Params, c distributorChannels, keypress <-chan rune) {
 	world := make([][]byte, p.ImageHeight)
 	for y := 0; y < p.ImageHeight; y++ {
 		world[y] = make([]byte, p.ImageWidth)
-		for x := 0; x < p.ImageWidth; x++ {x
+		for x := 0; x < p.ImageWidth; x++ {
 			world[y][x] = <-c.ioInput
 		}
 	}

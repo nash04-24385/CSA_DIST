@@ -81,24 +81,54 @@ func (broker *Broker) assignNeighbours() error {
 	return nil
 }
 
+func splitWorld(world [][]byte, sections []section) [][][]byte {
+	var result [][][]byte
+	for _, s := range sections {
+		part := world[s.start:s.end]
+		result = append(result, part)
+	}
+	return result
+}
+
 /* RPC : Start distributed halo exchange simulation */
 func (broker *Broker) StartSimulation(p gol.Params, _ *struct{}) error {
 	fmt.Println("Starting simulation...")
-	for _, addr := range broker.workerAddresses {
+
+	// Example placeholder world until you connect this to distributor
+	world := make([][]byte, p.ImageHeight)
+	for y := range world {
+		world[y] = make([]byte, p.ImageWidth)
+	}
+
+	sections := assignSections(p.ImageHeight, len(broker.workerAddresses))
+	splitWorlds := splitWorld(world, sections)
+
+	for i, addr := range broker.workerAddresses {
 		client, err := rpc.Dial("tcp", addr)
 		if err != nil {
 			fmt.Println("Error connecting to worker", addr, ":", err)
 			continue
 		}
 
+		// 1️⃣ Send world section first
+		err = client.Call("GOLWorker.ReceiveWorld", splitWorlds[i], nil)
+		if err != nil {
+			fmt.Println("Error sending world to", addr, ":", err)
+			client.Close()
+			continue
+		}
+		fmt.Println("Sent world section to", addr)
+
+		// 2️⃣ Start simulation
 		err = client.Call("GOLWorker.StartSimulation", p, nil)
 		if err != nil {
-			fmt.Println("Error starting simulation on ", addr, ":", err)
+			fmt.Println("Error starting simulation on", addr, ":", err)
 		} else {
-			fmt.Println("Started simulation on worker: ", addr)
+			fmt.Println("Started simulation on worker:", addr)
 		}
 		client.Close()
 	}
+
 	return nil
 }
 

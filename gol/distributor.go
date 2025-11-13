@@ -77,9 +77,9 @@ func distributor(p Params, c distributorChannels, keypress <-chan rune) {
 
 	// 5. Start Halo Exchange simulation
 	fmt.Println("Starting simulation via broker...")
-	err = client.Call("Broker.StartSimulation", p, nil)
+	err = client.Call("Broker.startSimulation", p, nil)
 	if err != nil {
-		fmt.Println("Error calling StartSimulation:", err)
+		fmt.Println("Error calling startSimulation:", err)
 		return
 	}
 

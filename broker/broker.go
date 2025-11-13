@@ -82,7 +82,7 @@ func (broker *Broker) assignNeighbours() error {
 }
 
 /* RPC : Start distributed halo exchange simulation */
-func (broker *Broker) startSimulation(p gol.Params, _ *struct{}) error {
+func (broker *Broker) StartSimulation(p gol.Params, _ *struct{}) error {
 	fmt.Println("Starting simulation...")
 	for _, addr := range broker.workerAddresses {
 		client, err := rpc.Dial("tcp", addr)

@@ -21,7 +21,7 @@ type distributorChannels struct {
 // distributor divides the work between workers and interacts with the broker
 func distributor(p Params, c distributorChannels, keypress <-chan rune) {
 	// 1. Read input world as before
-	filename := fmt.Sprintf("%d%d", p.ImageWidth, p.ImageHeight)
+	filename := fmt.Sprintf("%dx%d", p.ImageWidth, p.ImageHeight)
 	c.ioCommand <- ioInput
 	c.ioFilename <- filename
 

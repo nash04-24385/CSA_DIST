@@ -1,7 +1,6 @@
 package main
 
 import (
-	"encoding/gob"
 	"fmt"
 	"net"
 	"net/rpc"
@@ -18,9 +17,14 @@ import (
 type GOLWorker struct {
 	Neigh   gol.Neighbours // up/down neighbour info
 	Section [][]byte       // worker’s own part of the world
-	StartY  int            // start index (for reconstruction)
+	StartY  int            // optional: for debug
 	EndY    int
 	Params  gol.Params
+}
+
+// This type is used for halo exchange RPCs between workers.
+type HaloMsg struct {
+	Row []byte
 }
 
 // ------------------------------------------------------------
@@ -36,6 +40,7 @@ func (w *GOLWorker) SetupNeighbours(neigh gol.Neighbours, _ *struct{}) error {
 // ------------------------------------------------------------
 // RPC: Receive world section (called by broker)
 // ------------------------------------------------------------
+
 func (w *GOLWorker) ReceiveWorld(section [][]byte, _ *struct{}) error {
 	if len(section) == 0 {
 		fmt.Println("⚠️ Received empty section — skipping.")
@@ -52,67 +57,93 @@ func (w *GOLWorker) ReceiveWorld(section [][]byte, _ *struct{}) error {
 
 func (w *GOLWorker) StartSimulation(p gol.Params, _ *struct{}) error {
 	w.Params = p
-
 	fmt.Printf("Worker starting Halo Exchange simulation (%d turns)...\n", p.Turns)
-
 	go w.runHaloSimulation()
-
 	return nil
 }
 
 // ------------------------------------------------------------
-// Halo Exchange core logic
+// Halo exchange RPC interface between workers
 // ------------------------------------------------------------
 
-type HaloMsg struct {
-	Row []byte
+// Called by DOWN neighbour to get our TOP row.
+func (w *GOLWorker) ExchangeUp(_ HaloMsg, resp *HaloMsg) error {
+	if len(w.Section) == 0 {
+		resp.Row = nil
+		return nil
+	}
+	resp.Row = w.Section[0]
+	return nil
 }
 
-// Sends top/bottom rows to neighbours and receives halos
+// Called by UP neighbour to get our BOTTOM row.
+func (w *GOLWorker) ExchangeDown(_ HaloMsg, resp *HaloMsg) error {
+	if len(w.Section) == 0 {
+		resp.Row = nil
+		return nil
+	}
+	resp.Row = w.Section[len(w.Section)-1]
+	return nil
+}
+
+// Local helper: talk to neighbours to get halo rows for this turn.
 func (w *GOLWorker) exchangeHalos(topRow, bottomRow []byte) ([]byte, []byte) {
 	upHaloCh := make(chan []byte, 1)
 	downHaloCh := make(chan []byte, 1)
 
-	// Send to UP neighbour, receive bottom halo from it
+	// Ask UP neighbour for its bottom row
 	go func() {
-		conn, err := net.Dial("tcp", w.Neigh.UpAddr)
+		defer close(upHaloCh)
+
+		client, err := rpc.Dial("tcp", w.Neigh.UpAddr)
 		if err != nil {
-			fmt.Println("Dial error (up):", err)
+			fmt.Println("RPC dial error (up):", err)
 			upHaloCh <- make([]byte, len(topRow))
 			return
 		}
-		defer conn.Close()
+		defer client.Close()
 
-		enc := gob.NewEncoder(conn)
-		dec := gob.NewDecoder(conn)
-
-		_ = enc.Encode(HaloMsg{Row: topRow})
-		var reply HaloMsg
-		_ = dec.Decode(&reply)
-		upHaloCh <- reply.Row
+		req := HaloMsg{Row: bottomRow}
+		var resp HaloMsg
+		if err := client.Call("GOLWorker.ExchangeDown", req, &resp); err != nil {
+			fmt.Println("RPC call error (up):", err)
+			upHaloCh <- make([]byte, len(topRow))
+			return
+		}
+		if resp.Row == nil {
+			resp.Row = make([]byte, len(topRow))
+		}
+		upHaloCh <- resp.Row
 	}()
 
-	// Send to DOWN neighbour, receive top halo from it
+	// Ask DOWN neighbour for its top row
 	go func() {
-		conn, err := net.Dial("tcp", w.Neigh.DownAddr)
+		defer close(downHaloCh)
+
+		client, err := rpc.Dial("tcp", w.Neigh.DownAddr)
 		if err != nil {
-			fmt.Println("Dial error (down):", err)
+			fmt.Println("RPC dial error (down):", err)
 			downHaloCh <- make([]byte, len(bottomRow))
 			return
 		}
-		defer conn.Close()
+		defer client.Close()
 
-		enc := gob.NewEncoder(conn)
-		dec := gob.NewDecoder(conn)
-
-		_ = enc.Encode(HaloMsg{Row: bottomRow})
-		var reply HaloMsg
-		_ = dec.Decode(&reply)
-		downHaloCh <- reply.Row
+		req := HaloMsg{Row: topRow}
+		var resp HaloMsg
+		if err := client.Call("GOLWorker.ExchangeUp", req, &resp); err != nil {
+			fmt.Println("RPC call error (down):", err)
+			downHaloCh <- make([]byte, len(bottomRow))
+			return
+		}
+		if resp.Row == nil {
+			resp.Row = make([]byte, len(bottomRow))
+		}
+		downHaloCh <- resp.Row
 	}()
 
 	upHalo := <-upHaloCh
 	downHalo := <-downHaloCh
+
 	return upHalo, downHalo
 }
 
@@ -121,42 +152,53 @@ func (w *GOLWorker) exchangeHalos(topRow, bottomRow []byte) ([]byte, []byte) {
 // ------------------------------------------------------------
 
 func (w *GOLWorker) runHaloSimulation() {
-	h := w.Params.ImageHeight
-	wid := w.Params.ImageWidth
+	if len(w.Section) == 0 || w.Params.ImageWidth == 0 || w.Params.Turns == 0 {
+		w.notifyBrokerFinished()
+		return
+	}
+
+	width := w.Params.ImageWidth
 	turns := w.Params.Turns
 
 	for turn := 0; turn < turns; turn++ {
+		rows := len(w.Section)
+		if rows == 0 {
+			break
+		}
+
 		topRow := w.Section[0]
-		bottomRow := w.Section[len(w.Section)-1]
+		bottomRow := w.Section[rows-1]
 
 		// Exchange halos with neighbours
 		upHalo, downHalo := w.exchangeHalos(topRow, bottomRow)
 
 		// Compute new state with halos
-		newSection := w.calculateNextStatesWithHalo(h, wid, upHalo, downHalo)
-
-		w.Section = newSection
+		w.Section = w.calculateNextStatesWithHalo(width, upHalo, downHalo)
 
 		if turn%50 == 0 || turn == turns-1 {
 			fmt.Printf("Worker (%d-%d) completed turn %d\n", w.StartY, w.EndY, turn)
 		}
-		time.Sleep(1 * time.Millisecond) // optional throttle for debugging
+
+		// Small sleep is optional; helps debug
+		time.Sleep(1 * time.Millisecond)
 	}
 
 	fmt.Printf("Worker (%d-%d) finished all %d turns.\n", w.StartY, w.EndY, turns)
+	w.notifyBrokerFinished()
 }
 
 // ------------------------------------------------------------
 // Compute next state using halo rows
 // ------------------------------------------------------------
 
-func (w *GOLWorker) calculateNextStatesWithHalo(h, wdt int, upHalo, downHalo []byte) [][]byte {
+func (w *GOLWorker) calculateNextStatesWithHalo(width int, upHalo, downHalo []byte) [][]byte {
 	rows := len(w.Section)
 	newRows := make([][]byte, rows)
 
 	for i := 0; i < rows; i++ {
-		newRows[i] = make([]byte, wdt)
-		for j := 0; j < wdt; j++ {
+		newRows[i] = make([]byte, width)
+
+		for j := 0; j < width; j++ {
 			count := 0
 
 			upIndex := i - 1
@@ -176,8 +218,8 @@ func (w *GOLWorker) calculateNextStatesWithHalo(h, wdt int, upHalo, downHalo []b
 				downRow = w.Section[downIndex]
 			}
 
-			left := (j - 1 + wdt) % wdt
-			right := (j + 1) % wdt
+			left := (j - 1 + width) % width
+			right := (j + 1) % width
 
 			// count 8 neighbours
 			neighbours := []byte{
@@ -192,7 +234,7 @@ func (w *GOLWorker) calculateNextStatesWithHalo(h, wdt int, upHalo, downHalo []b
 				}
 			}
 
-			// update cell
+			// update cell (standard GoL rules)
 			if w.Section[i][j] == 255 {
 				if count == 2 || count == 3 {
 					newRows[i][j] = 255
@@ -221,7 +263,24 @@ func (w *GOLWorker) GetSection(_ struct{}, out *[][]byte) error {
 }
 
 // ------------------------------------------------------------
-// RPC: Shutdown (unchanged)
+// RPC: GetAliveCount – used by broker for stats
+// ------------------------------------------------------------
+
+func (w *GOLWorker) GetAliveCount(_ struct{}, out *int) error {
+	count := 0
+	for _, row := range w.Section {
+		for _, cell := range row {
+			if cell == 255 {
+				count++
+			}
+		}
+	}
+	*out = count
+	return nil
+}
+
+// ------------------------------------------------------------
+// RPC: Shutdown
 // ------------------------------------------------------------
 
 func (w *GOLWorker) Shutdown(_ struct{}, _ *struct{}) error {
@@ -233,14 +292,38 @@ func (w *GOLWorker) Shutdown(_ struct{}, _ *struct{}) error {
 }
 
 // ------------------------------------------------------------
-// Main (unchanged except log)
+// Notify broker that this worker has finished all turns
+// ------------------------------------------------------------
+
+func (w *GOLWorker) notifyBrokerFinished() {
+	brokerAddr := os.Getenv("BROKER_ADDRESS")
+	if brokerAddr == "" {
+		brokerAddr = "localhost:8040"
+	}
+
+	client, err := rpc.Dial("tcp", brokerAddr)
+	if err != nil {
+		fmt.Println("Error connecting to broker to report finish:", err)
+		return
+	}
+	defer client.Close()
+
+	var reply struct{}
+	if err := client.Call("Broker.WorkerFinished", struct{}{}, &reply); err != nil {
+		fmt.Println("Error calling Broker.WorkerFinished:", err)
+	} else {
+		fmt.Println("Reported completion to broker.")
+	}
+}
+
+// ------------------------------------------------------------
+// Main
 // ------------------------------------------------------------
 
 func main() {
-	err := rpc.RegisterName("GOLWorker", new(GOLWorker))
-	if err != nil {
+	if err := rpc.RegisterName("GOLWorker", new(GOLWorker)); err != nil {
 		fmt.Println("Error registering RPC:", err)
-		return
+		os.Exit(1)
 	}
 
 	listener, err := net.Listen("tcp4", "0.0.0.0:8030")

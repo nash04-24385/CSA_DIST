@@ -54,159 +54,134 @@ func assignSections(height, workers int) []section {
 	return sections
 }
 
-// function to count the number of alive cells
-func countAlive(world [][]byte) int {
-	count := 0
-	for y := range world {
-		for x := range world[y] {
-			if world[y][x] == 255 {
-				count++
-			}
+/* HALO EXCHANGE SETUP */
+
+func (broker *Broker) assignNeighbours() error {
+	numWorker := len(broker.workerAddresses)
+	for i, addr := range broker.workerAddresses {
+		top := broker.workerAddresses[(i-1+numWorker)%numWorker]
+		bottom := broker.workerAddresses[(i+1)%numWorker]
+
+		neighbour := gol.Neighbours{UpAddr: top, DownAddr: bottom}
+
+		client, err := rpc.Dial("tcp", addr)
+		if err != nil {
+			fmt.Println("Error connecting to worker", addr, ":", err)
+			continue
 		}
-	}
 
-	return count
-}
-
-// one iteration of the game using all workers
-func (broker *Broker) ProcessSection(req gol.BrokerRequest, res *gol.BrokerResponse) error {
-	p := req.Params
-	world := req.World
-
-	numWorkers := len(broker.workerAddresses)
-
-	// throw an error in teh case of there not being any workers dialled
-	if numWorkers == 0 {
-		return fmt.Errorf("no workers registered")
-	}
-
-	// assign different sections of the image to each worker (aws node)
-	sections := assignSections(p.ImageHeight, numWorkers)
-
-	type sectionResult struct {
-		start int
-		rows  [][]byte
-		err   error
-	}
-
-	resultsChan := make(chan sectionResult, numWorkers)
-
-	// for each worker, assign the sections
-	for i, address := range broker.workerAddresses {
-		section := sections[i]
-		address := address
-
-		// process for each worker
-		go func() {
-
-			client, err := rpc.Dial("tcp", address)
-			if err != nil {
-				resultsChan <- sectionResult{err: fmt.Errorf("dial %s: %w", address, err)}
-				return
-			}
-
-			defer client.Close()
-
-			// section request
-			sectionReq := gol.SectionRequest{
-				Params: p,
-				World:  world,
-				StartY: section.start,
-				EndY:   section.end,
-			}
-
-			var sectionRes gol.SectionResponse
-
-			if err := client.Call("GOLWorker.ProcessSection", sectionReq, &sectionRes); err != nil {
-				resultsChan <- sectionResult{err: fmt.Errorf("dial %s: %w", address, err)}
-				return
-			}
-
-			resultsChan <- sectionResult{
-				start: sectionRes.StartY,
-				rows:  sectionRes.Section,
-				err:   nil,
-			}
-
-		}()
-	}
-
-	results := make([]sectionResult, numWorkers)
-	for i := 0; i < numWorkers; i++ {
-		results[i] = <-resultsChan
-	}
-
-	close(resultsChan)
-
-	// build new world from the individual sections
-	newWorld := make([][]byte, p.ImageHeight)
-	for _, result := range results {
-		for i, row := range result.rows {
-			newWorld[result.start+i] = row
+		err = client.Call("GOLWorker.SetupNeighbours", neighbour, nil)
+		if err != nil {
+			fmt.Println("Error setting up neighbours for ", addr, ":", err)
+		} else {
+			fmt.Println("Set neighbours for ", addr, " -> top:", top, " -> bottom:", bottom)
 		}
+		client.Close()
 	}
-
-	broker.turn++
-	broker.alive = countAlive(newWorld)
-
-	res.World = newWorld
 	return nil
 }
+
+/* RPC : Start distributed halo exchange simulation */
+func (broker *Broker) startSimulation(p gol.Params, _ *struct{}) error {
+	fmt.Println("Starting simulation...")
+	for _, addr := range broker.workerAddresses {
+		client, err := rpc.Dial("tcp", addr)
+		if err != nil {
+			fmt.Println("Error connecting to worker", addr, ":", err)
+			continue
+		}
+
+		err = client.Call("GOLWorker.StartSimulation", p, nil)
+		if err != nil {
+			fmt.Println("Error starting simulation on ", addr, ":", err)
+		} else {
+			fmt.Println("Started simulation on worker: ", addr)
+		}
+		client.Close()
+	}
+	return nil
+}
+
+/* RPC : Collect final world from all workers */
+func (broker *Broker) finalWorld(_ struct{}, world *[][][]byte) error {
+	fmt.Println("Finalizing world...")
+	var results [][][]byte
+
+	for _, addr := range broker.workerAddresses {
+		client, err := rpc.Dial("tcp", addr)
+		if err != nil {
+			fmt.Println("Error connecting to worker", addr, ":", err)
+			continue
+		}
+
+		var section [][]byte
+		err = client.Call("GOLWorker.GetSection", struct{}{}, &section)
+		if err == nil {
+			results = append(results, section)
+			fmt.Println("Collected section from", addr)
+		} else {
+			fmt.Println("Error getting section from", addr, ":", err)
+		}
+		client.Close()
+	}
+	*world = results
+	return nil
+}
+
+/* Other existing broker rpcs */
 
 func (broker *Broker) GetAliveCount(_ struct{}, out *int) error {
 	*out = broker.alive
 	return nil
 }
 
-// We need a function that when q (quit) is pressed then the controller
-// exit without killing the simulation
-// when q is pressed we need to save the current board (pgm), then call a function that
-// doesnt persist the world -> basically do nothing
 func (broker *Broker) ControllerExit(_ gol.Empty, _ *gol.Empty) error {
+	fmt.Println("Controller exit requested — broker staying alive.")
 	return nil
 }
 
-// when k is pressed, we need to call a function that would send GOL.Shutdown
-// to each worker and then kill itself
-// then the controller saves the final image and exits
 func (broker *Broker) KillWorkers(_ gol.Empty, _ *gol.Empty) error {
+	fmt.Println("Kill signal received — shutting down all workers.")
 	for _, address := range broker.workerAddresses {
 		if c, err := rpc.Dial("tcp", address); err == nil {
 			_ = c.Call("GOLWorker.Shutdown", struct{}{}, nil)
 			_ = c.Close()
 		}
 	}
-
 	go os.Exit(0)
 	return nil
 }
 
+/* Main function */
 func main() {
-
+	// ⚠️ Add all your worker instance addresses here:
 	broker := &Broker{
 		workerAddresses: []string{
-			"3.91.156.154:8030",
+			"98.88.28.181:8030",
+			"54.221.38.168:8030", // change depending on ip
 		},
 	}
 
-	err := rpc.RegisterName("Broker", broker)
-
-	if err != nil {
+	// Register broker RPCs
+	if err := rpc.RegisterName("Broker", broker); err != nil {
 		fmt.Println("Error registering RPC:", err)
 		os.Exit(1)
-		return
 	}
 
+	// Setup Halo Exchange neighbour info
+	if err := broker.assignNeighbours(); err != nil {
+		fmt.Println("Neighbour assignment failed:", err)
+	}
+
+	// Listen for distributor (controller) connections
 	listener, err := net.Listen("tcp4", "0.0.0.0:8040")
 	if err != nil {
 		fmt.Println("Error starting listener:", err)
 		os.Exit(1)
-		return
 	}
 	fmt.Println("Broker listening on port 8040 (IPv4)...")
 
 	defer listener.Close()
-
 	for {
 		conn, err := listener.Accept()
 		if err != nil {

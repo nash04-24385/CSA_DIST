@@ -83,6 +83,19 @@ func distributor(p Params, c distributorChannels, keypress <-chan rune) {
 		return
 	}
 
+	if p.Turns == 0 {
+	fmt.Println("No turns to process — exiting immediately.")
+
+	aliveCells := AliveCells(world, p.ImageWidth, p.ImageHeight)
+	c.events <- FinalTurnComplete{CompletedTurns: 0, Alive: aliveCells}
+
+	saveImage(p, c, world, 0)
+
+	c.events <- StateChange{0, Quitting}
+	close(c.events)
+	return
+}
+
 	// workers now run autonomously on AWS (halo exchange between each other)
 	// we can wait for user input or periodically poll until simulation done
 

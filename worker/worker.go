@@ -34,6 +34,19 @@ func (w *GOLWorker) SetupNeighbours(neigh gol.Neighbours, _ *struct{}) error {
 }
 
 // ------------------------------------------------------------
+// RPC: Receive world section (called by broker)
+// ------------------------------------------------------------
+func (w *GOLWorker) ReceiveWorld(section [][]byte, _ *struct{}) error {
+	if len(section) == 0 {
+		fmt.Println("⚠️ Received empty section — skipping.")
+		return nil
+	}
+	w.Section = section
+	fmt.Printf("Worker received world section with %d rows\n", len(section))
+	return nil
+}
+
+// ------------------------------------------------------------
 // RPC: Start simulation (called by broker)
 // ------------------------------------------------------------
 

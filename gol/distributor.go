@@ -18,12 +18,10 @@ type distributorChannels struct {
 	ioInput    <-chan uint8
 }
 
-// distributor divides the work between workers and interacts with other goroutines.
+// distributor divides the work between workers and interacts with the broker
 func distributor(p Params, c distributorChannels, keypress <-chan rune) {
-
-	// TODO: Create a 2D slice to store the world.
-
-	filename := fmt.Sprintf("%dx%d", p.ImageWidth, p.ImageHeight)
+	// 1. Read input world as before
+	filename := fmt.Sprintf("%d%d", p.ImageWidth, p.ImageHeight)
 	c.ioCommand <- ioInput
 	c.ioFilename <- filename
 
@@ -35,43 +33,34 @@ func distributor(p Params, c distributorChannels, keypress <-chan rune) {
 		}
 	}
 
-	brokerAddr := os.Getenv("BROKER_ADDR")
+	// 2. Connect to broker
+	brokerAddr := os.Getenv("BROKER_ADDRESS")
 	if brokerAddr == "" {
-		brokerAddr = "localhost:8040" // default if env var not set
+		brokerAddr = "localhost:8040"
 	}
-
 	client, err := rpc.Dial("tcp", brokerAddr)
 	if err != nil {
 		fmt.Println("Error connecting to broker:", err)
 		return
 	}
-
 	defer client.Close()
 
-	// Start ticker to report alive cells every 2 seconds
+	// 3. Ticker to fetch alive counts
 	ticker := time.NewTicker(2 * time.Second)
-	//Channel used to sognal the goroutine to stop
 	done := make(chan bool)
-
 	turn := 0
 
 	go func() {
 		for {
 			select {
-			// Case runs every time the timer ticks (every 2 seconds)
 			case <-ticker.C:
 				var aliveCount int
-
 				err := client.Call("Broker.GetAliveCount", struct{}{}, &aliveCount)
-
-				if err != nil {
-					fmt.Println("Error calling GetAliveCount:", err)
-					continue
-				}
-
-				c.events <- AliveCellsCount{
-					CompletedTurns: turn,
-					CellsCount:     aliveCount,
+				if err == nil {
+					c.events <- AliveCellsCount{
+						CompletedTurns: turn,
+						CellsCount:     aliveCount,
+					}
 				}
 			case <-done:
 				return
@@ -79,28 +68,26 @@ func distributor(p Params, c distributorChannels, keypress <-chan rune) {
 		}
 	}()
 
-	// calculates which cells are alive in the inital state before a turn has been made
+	//4. Initial events
 	initialAlive := AliveCells(world, p.ImageWidth, p.ImageHeight)
 	if len(initialAlive) > 0 {
-		c.events <- CellsFlipped{
-			CompletedTurns: 0,
-			Cells:          initialAlive}
+		c.events <- CellsFlipped{CompletedTurns: 0, Cells: initialAlive}
 	}
-
 	c.events <- StateChange{turn, Executing}
 
-	// for each turn it needs to split up the jobs,
-	// such that there is one job from eahc section for each thread
-	// needs to gather the results and then put them together for the newstate of world
-	// TODO: Execute all turns of the Game of Life.
+	// 5. Start Halo Exchange simulation
+	fmt.Println("Starting simulation via broker...")
+	err = client.Call("Broker.StartSimulation", p, nil)
+	if err != nil {
+		fmt.Println("Error calling StartSimulation:", err)
+		return
+	}
 
-	//----------------------------------------------------------------------------------------------------------//
-	//----------------------------------------------------------------------------------------------------------//
+	// workers now run autonomously on AWS (halo exchange between each other)
+	// we can wait for user input or periodically poll until simulation done
 
-	// variables for step 5
+	// 6. Wait for simulation to complete or handle user inputs
 	paused := false
-	quitting := false
-
 	for {
 		select {
 		case key := <-keypress:
@@ -108,11 +95,11 @@ func distributor(p Params, c distributorChannels, keypress <-chan rune) {
 			case 'p':
 				if !paused {
 					paused = true
-					fmt.Println("paused at turn:", turn)
+					fmt.Println("Paused.")
 					c.events <- StateChange{turn, Paused}
 				} else {
 					paused = false
-					fmt.Println("continuing")
+					fmt.Println("Resumed.")
 					c.events <- StateChange{turn, Executing}
 				}
 			case 's':
@@ -123,10 +110,9 @@ func distributor(p Params, c distributorChannels, keypress <-chan rune) {
 				done <- true
 				ticker.Stop()
 				c.events <- StateChange{turn, Quitting}
-				fmt.Println("quitting, sending signal to worker")
+				fmt.Println("Quitting...")
 				close(c.events)
 				return
-
 			case 'k':
 				saveImage(p, c, world, turn)
 				client.Call("Broker.KillWorkers", Empty{}, &Empty{})
@@ -134,87 +120,19 @@ func distributor(p Params, c distributorChannels, keypress <-chan rune) {
 				ticker.Stop()
 				c.events <- StateChange{turn, Quitting}
 				close(c.events)
-				fmt.Println("shutting down full system")
+				fmt.Println("Full system shutdown.")
 				os.Exit(0)
-
 			}
-			continue
 		default:
+			// We can add polling here if desired
+			time.Sleep(1 * time.Second)
 		}
-
-		// quit if acc finished and not paused
-		if quitting || (turn >= p.Turns && !paused) {
-			break
-		}
-
-		if paused {
-			time.Sleep(10 * time.Millisecond)
-			continue
-		}
-
-		request := BrokerRequest{
-			Params: p,
-			World:  world,
-		}
-
-		var response BrokerResponse
-
-		err = client.Call("Broker.ProcessSection", request, &response)
-		if err != nil {
-			fmt.Println("Error calling broker.ProcessSection:", err)
-			quitting = true
-			continue
-		}
-
-		///// STEP 6 CELLS FLIPPED///////////
-		// At the end of each turn, put all changed coordinates into a slice,
-		// and then send CellsFlipped event
-		// make a slice so as to compare the old row and the new row of the world
-		flippedCells := make([]util.Cell, 0)
-		// go row by row, then column by column
-		for y := 0; y < p.ImageHeight; y++ {
-			for x := 0; x < p.ImageWidth; x++ {
-				if world[y][x] != response.World[y][x] {
-					flippedCells = append(flippedCells, util.Cell{X: x, Y: y})
-				}
-			}
-		}
-
-		// if there is at least one cell thats been flipped then we need to return the
-		// Cells Flipped event
-		if len(flippedCells) > 0 {
-			c.events <- CellsFlipped{
-				CompletedTurns: turn + 1,
-				Cells:          flippedCells}
-		}
-
-		world = response.World
-
-		///// STEP 6 TURN COMPLETE///////////
-		// At the end of each turn we need to signal that a turn is completed
-		c.events <- TurnComplete{
-			CompletedTurns: turn + 1,
-		}
-
-		turn++ //advance turn
 	}
 
-	//Stop ticker after finishing all turns
-	done <- true
-	ticker.Stop()
-
-	// TODO: Report the final state using FinalTurnCompleteEvent.
-	aliveCells := AliveCells(world, p.ImageWidth, p.ImageHeight)
-	c.events <- FinalTurnComplete{CompletedTurns: turn, Alive: aliveCells}
-
-	//save final output
-	saveImage(p, c, world, turn)
-	c.events <- StateChange{turn, Quitting}
-
-	//Close the channels to stop the SDL goroutine gracefully. Removing may cause deadlock.
-	close(c.events)
-
+	
 }
+
+// HELPER FUNCTIONS :
 
 func AliveCells(world [][]byte, width, height int) []util.Cell {
 	cells := make([]util.Cell, 0)
@@ -228,27 +146,19 @@ func AliveCells(world [][]byte, width, height int) []util.Cell {
 	return cells
 }
 
-// helper function to handle image saves
 func saveImage(p Params, c distributorChannels, world [][]byte, turn int) {
-	// Write final world to output file (PGM)
-	// Construct the output filename in the required format
-	// Example: "512x512x100" for a 512x512 world after 100 turns
 	outFileName := fmt.Sprintf("%dx%dx%d", p.ImageWidth, p.ImageHeight, turn)
-	c.ioCommand <- ioOutput     // telling the i/o goroutine that we are starting an output operation
-	c.ioFilename <- outFileName // sending the filename to io goroutine
+	c.ioCommand <- ioOutput
+	c.ioFilename <- outFileName
 
 	for y := 0; y < p.ImageHeight; y++ {
 		for x := 0; x < p.ImageWidth; x++ {
-			//writing the pixel value to the ioOutput channel
-			c.ioOutput <- world[y][x] //grayscale value for that pixel (0 or 255)
+			c.ioOutput <- world[y][x]
 		}
 	}
 
-	// Make sure that the Io has finished any output before exiting.
 	c.ioCommand <- ioCheckIdle
 	<-c.ioIdle
-
-	// once saved, notify the SDL event system (important for Step 5)
 	c.events <- ImageOutputComplete{CompletedTurns: turn, Filename: outFileName}
-
 }
+

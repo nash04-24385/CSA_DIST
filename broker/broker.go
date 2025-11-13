@@ -5,104 +5,143 @@ import (
 	"net"
 	"net/rpc"
 	"os"
+	"sync"
+	"time"
 
 	"uk.ac.bris.cs/gameoflife/gol"
 )
 
-// the broker will keep track of the multiple GOLWorkers
-// can use to tell us how many workers we have and then split up the image based on that
+// Broker keeps track of all worker instances and coordinates the
+// distributed Game of Life simulation.
 type Broker struct {
 	workerAddresses []string
-	turn            int
-	alive           int
+
+	mu            sync.Mutex
+	finishedCount int
 }
 
-type section struct {
-	start int
-	end   int
+// ------------------------------------------------------------
+// Helper types / functions used only inside the broker
+// ------------------------------------------------------------
+
+// workerSection represents the vertical slice of rows a worker owns:
+// rows in [startY, endY] (endY is exclusive).
+type workerSection struct {
+	startY int
+	endY   int
 }
 
-// assign section helper function from before
-// helper func to assign sections of image to workers based on no. of threads
-func assignSections(height, workers int) []section {
+// assignSections splits the total image height into roughly-equal
+// vertical slices, one per worker.
+func assignSections(height, numWorkers int) []workerSection {
+	sections := make([]workerSection, numWorkers)
 
-	// we need to calculate the minimum number of rows for each worker
-	minRows := height / workers
-	// then say if we have extra rows left over then we need to assign those evenly to each worker
-	extraRows := height % workers
+	base := height / numWorkers
+	extra := height % numWorkers
 
-	// make a slice, the size of the number of threads
-	sections := make([]section, workers)
 	start := 0
-
-	for i := 0; i < workers; i++ {
-		// assigns the base amount of rows to the thread
-		rows := minRows
-		// if say we're on worker 2 and there are 3 extra rows left,
-		// then we can add 1 more job to the thread
-		if i < extraRows {
+	for i := 0; i < numWorkers; i++ {
+		rows := base
+		if i < extra {
 			rows++
 		}
-
-		// marks where the end of the section ends
 		end := start + rows
-		// assigns these rows to the section
-		sections[i] = section{start: start, end: end}
-		// start is updated for the next worker
+		sections[i] = workerSection{startY: start, endY: end}
 		start = end
 	}
+
 	return sections
 }
 
-/* HALO EXCHANGE SETUP */
+// splitWorld copies the global world into one sub-world per worker
+// based on the sections returned by assignSections.
+func splitWorld(world [][]byte, sections []workerSection) [][][]byte {
+	parts := make([][][]byte, len(sections))
+	width := 0
+	if len(world) > 0 {
+		width = len(world[0])
+	}
 
+	for i, s := range sections {
+		h := s.endY - s.startY
+		sub := make([][]byte, h)
+		for row := 0; row < h; row++ {
+			sub[row] = make([]byte, width)
+			copy(sub[row], world[s.startY+row])
+		}
+		parts[i] = sub
+	}
+	return parts
+}
+
+// ------------------------------------------------------------
+// RPC: setup neighbour relationships between workers
+// ------------------------------------------------------------
+
+// assignNeighbours arranges workers in a vertical ring and tells each
+// worker who its up/down neighbours are.
 func (broker *Broker) assignNeighbours() error {
-	numWorker := len(broker.workerAddresses)
-	for i, addr := range broker.workerAddresses {
-		top := broker.workerAddresses[(i-1+numWorker)%numWorker]
-		bottom := broker.workerAddresses[(i+1)%numWorker]
+	numWorkers := len(broker.workerAddresses)
+	if numWorkers == 0 {
+		return fmt.Errorf("no workers configured on broker")
+	}
 
-		neighbour := gol.Neighbours{UpAddr: top, DownAddr: bottom}
+	for i, addr := range broker.workerAddresses {
+		up := broker.workerAddresses[(i-1+numWorkers)%numWorkers]
+		down := broker.workerAddresses[(i+1)%numWorkers]
+
+		neigh := gol.Neighbours{
+			UpAddr:   up,
+			DownAddr: down,
+		}
 
 		client, err := rpc.Dial("tcp", addr)
 		if err != nil {
-			fmt.Println("Error connecting to worker", addr, ":", err)
+			fmt.Println("Error connecting to worker", addr, "for neighbour setup:", err)
 			continue
 		}
 
-		err = client.Call("GOLWorker.SetupNeighbours", neighbour, nil)
-		if err != nil {
-			fmt.Println("Error setting up neighbours for ", addr, ":", err)
+		if err := client.Call("GOLWorker.SetupNeighbours", neigh, nil); err != nil {
+			fmt.Println("Error calling SetupNeighbours on", addr, ":", err)
 		} else {
-			fmt.Println("Set neighbours for ", addr, " -> top:", top, " -> bottom:", bottom)
+			fmt.Println("Configured neighbours for worker", addr, "→ up:", up, "down:", down)
 		}
+
 		client.Close()
 	}
+
 	return nil
 }
 
-func splitWorld(world [][]byte, sections []section) [][][]byte {
-	var result [][][]byte
-	for _, s := range sections {
-		part := world[s.start:s.end]
-		result = append(result, part)
+// ------------------------------------------------------------
+// RPC: start the simulation on all workers
+// ------------------------------------------------------------
+
+// StartSimulation is invoked by the distributor/controller. It receives
+// both the simulation Params and the initial world, splits the world
+// into sections, sends each section to a worker, and then starts the
+// simulation on each worker. It only returns when all workers report
+// that they have finished.
+func (broker *Broker) StartSimulation(args gol.SimulationArgs, _ *struct{}) error {
+	fmt.Println("Starting simulation from broker...")
+
+	p := args.Params
+	world := args.World
+
+	if len(broker.workerAddresses) == 0 {
+		return fmt.Errorf("no workers available to start simulation")
 	}
-	return result
-}
 
-/* RPC : Start distributed halo exchange simulation */
-func (broker *Broker) StartSimulation(p gol.Params, _ *struct{}) error {
-	fmt.Println("Starting simulation...")
-
-	// Example placeholder world until you connect this to distributor
-	world := make([][]byte, p.ImageHeight)
-	for y := range world {
-		world[y] = make([]byte, p.ImageWidth)
-	}
-
+	// 1. Split world into vertical sections
 	sections := assignSections(p.ImageHeight, len(broker.workerAddresses))
 	splitWorlds := splitWorld(world, sections)
 
+	// Reset finished counter
+	broker.mu.Lock()
+	broker.finishedCount = 0
+	broker.mu.Unlock()
+
+	// 2. Send sections and start simulation on each worker
 	for i, addr := range broker.workerAddresses {
 		client, err := rpc.Dial("tcp", addr)
 		if err != nil {
@@ -110,30 +149,128 @@ func (broker *Broker) StartSimulation(p gol.Params, _ *struct{}) error {
 			continue
 		}
 
-		// 1️⃣ Send world section first
-		err = client.Call("GOLWorker.ReceiveWorld", splitWorlds[i], nil)
-		if err != nil {
-			fmt.Println("Error sending world to", addr, ":", err)
+		// send world section
+		if err := client.Call("GOLWorker.ReceiveWorld", splitWorlds[i], nil); err != nil {
+			fmt.Println("Error sending world section to", addr, ":", err)
 			client.Close()
 			continue
 		}
-		fmt.Println("Sent world section to", addr)
+		fmt.Println("Sent world section to worker", addr)
 
-		// 2️⃣ Start simulation
-		err = client.Call("GOLWorker.StartSimulation", p, nil)
-		if err != nil {
+		// start simulation
+		if err := client.Call("GOLWorker.StartSimulation", p, nil); err != nil {
 			fmt.Println("Error starting simulation on", addr, ":", err)
 		} else {
-			fmt.Println("Started simulation on worker:", addr)
+			fmt.Println("Started simulation on worker", addr)
 		}
+
+		client.Close()
+	}
+
+	// 3. Wait until all workers have reported completion
+	for {
+		broker.mu.Lock()
+		done := broker.finishedCount >= len(broker.workerAddresses)
+		broker.mu.Unlock()
+
+		if done {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	fmt.Println("All workers finished simulation.")
+	return nil
+}
+
+// ------------------------------------------------------------
+// RPC: WorkerFinished – called by workers when they are done
+// ------------------------------------------------------------
+
+func (broker *Broker) WorkerFinished(_ struct{}, _ *struct{}) error {
+	broker.mu.Lock()
+	broker.finishedCount++
+	count := broker.finishedCount
+	broker.mu.Unlock()
+
+	fmt.Println("Worker finished. Total finished:", count)
+	return nil
+}
+
+// ------------------------------------------------------------
+// RPC: GetAliveCount – called periodically by distributor to update UI
+// ------------------------------------------------------------
+
+func (broker *Broker) GetAliveCount(_ struct{}, alive *int) error {
+	total := 0
+
+	for _, addr := range broker.workerAddresses {
+		client, err := rpc.Dial("tcp", addr)
+		if err != nil {
+			fmt.Println("Error connecting to worker", addr, "for alive count:", err)
+			continue
+		}
+
+		var count int
+		// Now backed by GOLWorker.GetAliveCount.
+		if err := client.Call("GOLWorker.GetAliveCount", struct{}{}, &count); err != nil {
+			fmt.Println("Error calling GetAliveCount on", addr, ":", err)
+			client.Close()
+			continue
+		}
+
+		total += count
+		client.Close()
+	}
+
+	*alive = total
+	return nil
+}
+
+// ------------------------------------------------------------
+// RPC: ControllerExit – called when the local controller quits
+// ------------------------------------------------------------
+
+func (broker *Broker) ControllerExit(_ gol.Empty, _ *gol.Empty) error {
+	fmt.Println("Controller exited – broker noted.")
+	return nil
+}
+
+// ------------------------------------------------------------
+// RPC: KillWorkers – terminate all workers
+// ------------------------------------------------------------
+
+func (broker *Broker) KillWorkers(_ gol.Empty, _ *gol.Empty) error {
+	fmt.Println("Killing all workers...")
+
+	for _, addr := range broker.workerAddresses {
+		client, err := rpc.Dial("tcp", addr)
+		if err != nil {
+			fmt.Println("Error connecting to worker", addr, "for shutdown:", err)
+			continue
+		}
+
+		// IMPORTANT: reply must be a non-nil pointer for net/rpc.
+		var reply struct{}
+		if err := client.Call("GOLWorker.Shutdown", struct{}{}, &reply); err != nil {
+			fmt.Println("Error shutting down worker", addr, ":", err)
+		} else {
+			fmt.Println("Shutdown signal sent to worker", addr)
+		}
+
 		client.Close()
 	}
 
 	return nil
 }
 
-/* RPC : Collect final world from all workers */
-func (broker *Broker) finalWorld(_ struct{}, world *[][][]byte) error {
+// ------------------------------------------------------------
+// RPC: CollectFinalWorld – gather final sections from all workers
+// ------------------------------------------------------------
+
+// CollectFinalWorld asks each worker for its final world section and
+// returns a slice of sections for the distributor to merge.
+func (broker *Broker) CollectFinalWorld(_ struct{}, world *[][][]byte) error {
 	fmt.Println("Finalizing world...")
 	var results [][][]byte
 
@@ -145,68 +282,47 @@ func (broker *Broker) finalWorld(_ struct{}, world *[][][]byte) error {
 		}
 
 		var section [][]byte
-		err = client.Call("GOLWorker.GetSection", struct{}{}, &section)
-		if err == nil {
-			results = append(results, section)
-			fmt.Println("Collected section from", addr)
-		} else {
+		if err := client.Call("GOLWorker.GetSection", struct{}{}, &section); err != nil {
 			fmt.Println("Error getting section from", addr, ":", err)
+			client.Close()
+			continue
 		}
+
+		results = append(results, section)
 		client.Close()
 	}
+
 	*world = results
+	fmt.Println("Collected", len(results), "sections from workers.")
 	return nil
 }
 
-/* Other existing broker rpcs */
+// ------------------------------------------------------------
+// main – start RPC server
+// ------------------------------------------------------------
 
-func (broker *Broker) GetAliveCount(_ struct{}, out *int) error {
-	*out = broker.alive
-	return nil
-}
-
-func (broker *Broker) ControllerExit(_ gol.Empty, _ *gol.Empty) error {
-	fmt.Println("Controller exit requested — broker staying alive.")
-	return nil
-}
-
-func (broker *Broker) KillWorkers(_ gol.Empty, _ *gol.Empty) error {
-	fmt.Println("Kill signal received — shutting down all workers.")
-	for _, address := range broker.workerAddresses {
-		if c, err := rpc.Dial("tcp", address); err == nil {
-			_ = c.Call("GOLWorker.Shutdown", struct{}{}, nil)
-			_ = c.Close()
-		}
-	}
-	go os.Exit(0)
-	return nil
-}
-
-/* Main function */
 func main() {
-	// ⚠️ Add all your worker instance addresses here:
 	broker := &Broker{
 		workerAddresses: []string{
-			"98.88.28.181:8030",
-			"54.221.38.168:8030", // change depending on ip
+			// TODO: fill in your worker addresses here, e.g.:
+			"54.172.169.243:8030", //DISTCSA
+			"54.162.151.187:8030", //DISTCSA2
 		},
 	}
 
-	// Register broker RPCs
+	// Configure neighbour relationships once at startup.
+	if err := broker.assignNeighbours(); err != nil {
+		fmt.Println("Error assigning neighbours:", err)
+	}
+
 	if err := rpc.RegisterName("Broker", broker); err != nil {
 		fmt.Println("Error registering RPC:", err)
 		os.Exit(1)
 	}
 
-	// Setup Halo Exchange neighbour info
-	if err := broker.assignNeighbours(); err != nil {
-		fmt.Println("Neighbour assignment failed:", err)
-	}
-
-	// Listen for distributor (controller) connections
 	listener, err := net.Listen("tcp4", "0.0.0.0:8040")
 	if err != nil {
-		fmt.Println("Error starting listener:", err)
+		fmt.Println("Error starting broker listener:", err)
 		os.Exit(1)
 	}
 	fmt.Println("Broker listening on port 8040 (IPv4)...")

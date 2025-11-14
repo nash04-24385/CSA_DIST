@@ -88,6 +88,16 @@ func (w *GOLWorker) ExchangeDown(_ HaloMsg, resp *HaloMsg) error {
 
 // Local helper: talk to neighbours to get halo rows for this turn.
 func (w *GOLWorker) exchangeHalos(topRow, bottomRow []byte) ([]byte, []byte) {
+	rows := len(w.Section)
+
+	// Special case:
+	// - this worker owns the entire height of the world (no vertical split)
+	// - neighbours are the same (ring of size 1)
+	// then halos are just our own bottom/top rows (toroidal wrap), no RPC needed.
+	if rows == w.Params.ImageHeight && (w.Neigh.UpAddr == "" || w.Neigh.UpAddr == w.Neigh.DownAddr) {
+		return bottomRow, topRow
+	}
+
 	upHaloCh := make(chan []byte, 1)
 	downHaloCh := make(chan []byte, 1)
 
@@ -101,7 +111,7 @@ func (w *GOLWorker) exchangeHalos(topRow, bottomRow []byte) ([]byte, []byte) {
 			upHaloCh <- make([]byte, len(topRow))
 			return
 		}
-		defer client.Close()
+		defer func() { _ = client.Close() }()
 
 		req := HaloMsg{Row: bottomRow}
 		var resp HaloMsg
@@ -126,7 +136,7 @@ func (w *GOLWorker) exchangeHalos(topRow, bottomRow []byte) ([]byte, []byte) {
 			downHaloCh <- make([]byte, len(bottomRow))
 			return
 		}
-		defer client.Close()
+		defer func() { _ = client.Close() }()
 
 		req := HaloMsg{Row: topRow}
 		var resp HaloMsg

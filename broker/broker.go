@@ -305,8 +305,8 @@ func main() {
 	broker := &Broker{
 		workerAddresses: []string{
 			// TODO: fill in your worker addresses here, e.g.:
-			"54.172.169.243:8030", //DISTCSA
-			"54.162.151.187:8030", //DISTCSA2
+			"172.31.30.142:8030", //DISTCSA
+			"172.31.30.21:8030",  //DISTCSA2
 		},
 	}
 

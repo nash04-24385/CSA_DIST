@@ -201,67 +201,63 @@ func (w *GOLWorker) runHaloSimulation() {
 // Compute next state using halo rows
 // ------------------------------------------------------------
 
+// Compute next state using halo rows from neighbours.
 func (w *GOLWorker) calculateNextStatesWithHalo(width int, upHalo, downHalo []byte) [][]byte {
-	rows := len(w.Section)
-	newRows := make([][]byte, rows)
+    rows := len(w.Section)
+    newRows := make([][]byte, rows)
 
-	for i := 0; i < rows; i++ {
-		newRows[i] = make([]byte, width)
+    for y := 0; y < rows; y++ {
+        newRows[y] = make([]byte, width)
 
-		for j := 0; j < width; j++ {
-			count := 0
+        for x := 0; x < width; x++ {
+            neighbours := 0
 
-			upIndex := i - 1
-			downIndex := i + 1
+            // check 8 neighbours
+            for dy := -1; dy <= 1; dy++ {
+                for dx := -1; dx <= 1; dx++ {
+                    if dy == 0 && dx == 0 {
+                        continue
+                    }
 
-			// get neighbour rows safely (using halos if on boundary)
-			var upRow, downRow []byte
-			if upIndex < 0 {
-				upRow = upHalo
-			} else {
-				upRow = w.Section[upIndex]
-			}
+                    ny := y + dy
+                    var row []byte
+                    if ny < 0 {
+                        // row above the first -> comes from upHalo
+                        row = upHalo
+                    } else if ny >= rows {
+                        // row below the last -> comes from downHalo
+                        row = downHalo
+                    } else {
+                        row = w.Section[ny]
+                    }
 
-			if downIndex >= rows {
-				downRow = downHalo
-			} else {
-				downRow = w.Section[downIndex]
-			}
+                    nx := (x + dx + width) % width // horizontal wrap
+                    if row[nx] == 255 {
+                        neighbours++
+                    }
+                }
+            }
 
-			left := (j - 1 + width) % width
-			right := (j + 1) % width
+            // apply GoL rules
+            if w.Section[y][x] == 255 {
+                if neighbours == 2 || neighbours == 3 {
+                    newRows[y][x] = 255
+                } else {
+                    newRows[y][x] = 0
+                }
+            } else {
+                if neighbours == 3 {
+                    newRows[y][x] = 255
+                } else {
+                    newRows[y][x] = 0
+                }
+            }
+        }
+    }
 
-			// count 8 neighbours
-			neighbours := []byte{
-				upRow[left], upRow[j], upRow[right],
-				w.Section[i][left], w.Section[i][right],
-				downRow[left], downRow[j], downRow[right],
-			}
-
-			for _, cell := range neighbours {
-				if cell == 255 {
-					count++
-				}
-			}
-
-			// update cell (standard GoL rules)
-			if w.Section[i][j] == 255 {
-				if count == 2 || count == 3 {
-					newRows[i][j] = 255
-				} else {
-					newRows[i][j] = 0
-				}
-			} else {
-				if count == 3 {
-					newRows[i][j] = 255
-				} else {
-					newRows[i][j] = 0
-				}
-			}
-		}
-	}
-	return newRows
+    return newRows
 }
+
 
 // ------------------------------------------------------------
 // RPC: Return final section (for broker collection)

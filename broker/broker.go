@@ -364,23 +364,50 @@ func debugSequentialStep(p gol.Params, world [][]byte) [][]byte {
 	return next
 }
 
-// helper to compare two worlds and print the first mismatch
-func debugCompareWorlds(turn int, a, b [][]byte) {
-	if len(a) != len(b) {
-		fmt.Printf("[DEBUG] world mismatch at turn %d: different heights %d vs %d\n",
-			turn, len(a), len(b))
+// DEBUGGING
+// helper to print a row as 0/1 for easier debugging
+func rowBits(row []byte) string {
+	s := make([]byte, len(row))
+	for i, v := range row {
+		if v == 255 {
+			s[i] = '1'
+		} else {
+			s[i] = '0'
+		}
+	}
+	return string(s)
+}
+
+func debugCompareWorlds(turn int, dist, seq [][]byte) {
+	h := len(dist)
+	if h == 0 {
+		fmt.Printf("[DEBUG] empty worlds at turn %d\n", turn)
 		return
 	}
-	for y := range a {
-		if len(a[y]) != len(b[y]) {
+	w := len(dist[0])
+
+	for y := 0; y < h; y++ {
+		if len(dist[y]) != len(seq[y]) {
 			fmt.Printf("[DEBUG] world mismatch at turn %d: row %d length %d vs %d\n",
-				turn, y, len(a[y]), len(b[y]))
+				turn, y, len(dist[y]), len(seq[y]))
 			return
 		}
-		for x := range a[y] {
-			if a[y][x] != b[y][x] {
+		for x := 0; x < w; x++ {
+			if dist[y][x] != seq[y][x] {
 				fmt.Printf("[DEBUG] first cell mismatch at turn %d: (x=%d,y=%d) dist=%d seq=%d\n",
-					turn, x, y, a[y][x], b[y][x])
+					turn, x, y, dist[y][x], seq[y][x])
+
+				yUp := (y - 1 + h) % h
+				yDown := (y + 1) % h
+
+				fmt.Printf("[DEBUG] dist row y-1=%d: %s\n", yUp, rowBits(dist[yUp]))
+				fmt.Printf("[DEBUG] dist row y  =%d: %s\n", y, rowBits(dist[y]))
+				fmt.Printf("[DEBUG] dist row y+1=%d: %s\n", yDown, rowBits(dist[yDown]))
+
+				fmt.Printf("[DEBUG] seq  row y-1=%d: %s\n", yUp, rowBits(seq[yUp]))
+				fmt.Printf("[DEBUG] seq  row y  =%d: %s\n", y, rowBits(seq[y]))
+				fmt.Printf("[DEBUG] seq  row y+1=%d: %s\n", yDown, rowBits(seq[yDown]))
+
 				return
 			}
 		}

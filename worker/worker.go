@@ -182,6 +182,26 @@ func (w *GOLWorker) Step(_ struct{}, res *gol.SectionResponse) error {
 		bottomHalo = reply.Row
 	}
 
+	// DEBUG
+	if params.ImageWidth == 16 && params.ImageHeight == 16 {
+		// we know sections: worker0 [0,8), worker1 [8,16)
+		// this worker owns global rows [startY, startY+height)
+		// bad cell is global y=15 => local index = 15 - startY
+		localBottom := height - 1
+		targetX := 13
+
+		w.mu.RLock()
+		fmt.Printf("[WORKER DEBUG] Step: startY=%d, bottom local index=%d, x=%d\n",
+			startY, localBottom, targetX)
+
+		fmt.Printf("[WORKER DEBUG] local row-1: %v\n", w.localWorld[localBottom-1])
+		fmt.Printf("[WORKER DEBUG] local row  : %v\n", w.localWorld[localBottom])
+		w.mu.RUnlock()
+
+		fmt.Printf("[WORKER DEBUG] topHalo    : %v\n", topHalo)
+		fmt.Printf("[WORKER DEBUG] bottomHalo : %v\n", bottomHalo)
+	}
+
 	// 3. Compute next local slice using halos
 	w.mu.Lock()
 	newLocal := calculateNextUsingHalos(params, w.localWorld, topHalo, bottomHalo)

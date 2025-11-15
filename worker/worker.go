@@ -110,6 +110,10 @@ func (w *GOLWorker) SetTopHalo(req gol.HaloRow, _ *struct{}) error {
 
 	copy(w.topHalo, req.Row)
 	w.haloReceived++
+	//DEBUG
+	fmt.Printf("[WORKER Halo] SetTopHalo range=[%d,%d) received=%d/%d\n",
+		w.startY, w.endY, w.haloReceived, w.haloExpected)
+	
 	if w.haloReceived >= w.haloExpected {
 		w.condition.Broadcast()
 	}
@@ -129,6 +133,10 @@ func (w *GOLWorker) SetBottomHalo(req gol.HaloRow, _ *struct{}) error {
 
 	copy(w.bottomHalo, req.Row)
 	w.haloReceived++
+	//DEBUG
+	fmt.Printf("[WORKER Halo] SetTopHalo range=[%d,%d) received=%d/%d\n",
+		w.startY, w.endY, w.haloReceived, w.haloExpected)
+	
 	if w.haloReceived >= w.haloExpected {
 		w.condition.Broadcast()
 	}
@@ -178,6 +186,10 @@ func (w *GOLWorker) Step(_ struct{}, res *gol.SectionResponse) error {
 
 	w.haloExpected = neighbours
 	w.haloReceived = 0
+
+	// DEBUG
+	fmt.Printf("[WORKER Step] start range=[%d,%d) neighbours=%d expected=%d\n",
+		startY, startY+height, neighbours, w.haloExpected)
 
 	w.mu.RUnlock()
 
@@ -232,6 +244,9 @@ func (w *GOLWorker) Step(_ struct{}, res *gol.SectionResponse) error {
 		if w.haloExpected == 0 {
 			break
 		}
+		fmt.Printf("[WORKER Step] start range=[%d,%d) neighbours=%d expected=%d\n",
+			startY, startY+height, neighbours, w.haloExpected)
+
 		w.condition.Wait()
 	}
 

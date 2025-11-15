@@ -5,6 +5,7 @@ import (
 	"net"
 	"net/rpc"
 	"os"
+	"sync"
 
 	"uk.ac.bris.cs/gameoflife/gol"
 )
@@ -15,6 +16,14 @@ type Broker struct {
 	workerAddresses []string
 	turn            int
 	alive           int
+
+	mu sync.RWMutex
+
+	//Added new fields for the halo-exchange implementation
+
+	params      gol.Params // params stores the last Params used to initialise the workers
+	sections    []section  // sections remembers which global row range each worker owns
+	initialised bool       // tells us whether we've already sent initial slices to workers
 }
 
 type section struct {
@@ -69,19 +78,117 @@ func countAlive(world [][]byte) int {
 }
 
 // one iteration of the game using all workers
+
+//ProcessSection is called by the distributor once per turn
+/*
+In OG implementation, this function re-sent the entire world to every worker on every iteration, and each worker returned an updated slice.
+Every worker on every iteration, and each worker returned an updated slice.
+This matches the "easy" baseline in the coursework but has heavy communication overhead
+
+In halo exchange version, we change the behaviour:
+- On the first call, we split the world into sections and send each worker only its own slice plus the addresses of its neighbour workers
+- Workers keep this slice and manage halo rows internally
+- On every call (including the first after initialisation), we ask each worker to perform a single step (halo exchange + local update) and return its updated slice
+- we then stitch the full world together again for the distributor and/or tests
+
+*/
+
 func (broker *Broker) ProcessSection(req gol.BrokerRequest, res *gol.BrokerResponse) error {
 	p := req.Params
 	world := req.World
 
 	numWorkers := len(broker.workerAddresses)
-
-	// throw an error in teh case of there not being any workers dialled
 	if numWorkers == 0 {
 		return fmt.Errorf("no workers registered")
 	}
 
-	// assign different sections of the image to each worker (aws node)
-	sections := assignSections(p.ImageHeight, numWorkers)
+	// Snapshot current params/initialised under read lock so we can decide
+	// if we need to (re)initialise workers for this request.
+	broker.mu.RLock()
+	prevParams := broker.params
+	wasInitialised := broker.initialised
+	broker.mu.RUnlock()
+
+	needInit := !wasInitialised ||
+		p.ImageWidth != prevParams.ImageWidth ||
+		p.ImageHeight != prevParams.ImageHeight ||
+		p.Turns != prevParams.Turns ||
+		p.Threads != prevParams.Threads
+
+	// ---------------------------------------------------------------------
+	// (Re)initialise workers if needed
+	// ---------------------------------------------------------------------
+	if needInit {
+		sections := assignSections(p.ImageHeight, numWorkers)
+
+		// Build local slices for each worker *without* holding the lock
+		workerLocalWorlds := make([][][]byte, numWorkers)
+		for i, sec := range sections {
+			localHeight := sec.end - sec.start
+			localWorld := make([][]byte, localHeight)
+			for row := 0; row < localHeight; row++ {
+				localWorld[row] = make([]byte, p.ImageWidth)
+				copy(localWorld[row], world[sec.start+row])
+			}
+			workerLocalWorlds[i] = localWorld
+		}
+
+		// Perform InitSection RPCs (this can block, so no lock here)
+		for i, address := range broker.workerAddresses {
+			sec := sections[i]
+			localWorld := workerLocalWorlds[i]
+
+			// ring neighbours (single worker -> self-neighbour)
+			var aboveAddr, belowAddr string
+			if numWorkers == 1 {
+				aboveAddr = address
+				belowAddr = address
+			} else {
+				aboveAddr = broker.workerAddresses[(i-1+numWorkers)%numWorkers]
+				belowAddr = broker.workerAddresses[(i+1)%numWorkers]
+			}
+
+			initReq := gol.WorkerInitRequest{
+				Params:     p,
+				StartY:     sec.start,
+				EndY:       sec.end,
+				LocalWorld: localWorld,
+				AboveAddr:  aboveAddr,
+				BelowAddr:  belowAddr,
+			}
+
+			client, err := rpc.Dial("tcp", address)
+			if err != nil {
+				return fmt.Errorf("error dialing worker %s for InitSection: %w", address, err)
+			}
+
+			var reply struct{}
+			if err := client.Call("GOLWorker.InitSection", initReq, &reply); err != nil {
+				client.Close()
+				return fmt.Errorf("InitSection RPC failed for worker %s: %w", address, err)
+			}
+			client.Close()
+		}
+
+		// 🔐 Only now, once all InitSection RPCs succeeded, update shared state
+		broker.mu.Lock()
+		broker.params = p
+		broker.sections = sections
+		broker.initialised = true
+		broker.turn = 0
+		broker.alive = countAlive(world)
+		broker.mu.Unlock()
+	}
+
+	// ---------------------------------------------------------------------
+	// Step: ask each worker to perform one halo-exchange step
+	// ---------------------------------------------------------------------
+
+	// Take a snapshot of sections/params under read lock
+	broker.mu.RLock()
+	sections := broker.sections
+	params := broker.params
+	broker.mu.RUnlock()
 
 	type sectionResult struct {
 		start int
@@ -91,70 +198,69 @@ func (broker *Broker) ProcessSection(req gol.BrokerRequest, res *gol.BrokerRespo
 
 	resultsChan := make(chan sectionResult, numWorkers)
 
-	// for each worker, assign the sections
 	for i, address := range broker.workerAddresses {
-		section := sections[i]
+		sec := sections[i]
 		address := address
 
-		// process for each worker
-		go func() {
-
+		go func(sec section, address string) {
 			client, err := rpc.Dial("tcp", address)
 			if err != nil {
-				resultsChan <- sectionResult{err: fmt.Errorf("dial %s: %w", address, err)}
+				resultsChan <- sectionResult{err: fmt.Errorf("dial %s for Step: %w", address, err)}
 				return
 			}
-
 			defer client.Close()
 
-			// section request
-			sectionReq := gol.SectionRequest{
-				Params: p,
-				World:  world,
-				StartY: section.start,
-				EndY:   section.end,
-			}
+			var stepReq struct{}
+			var stepRes gol.SectionResponse
 
-			var sectionRes gol.SectionResponse
-
-			if err := client.Call("GOLWorker.ProcessSection", sectionReq, &sectionRes); err != nil {
-				resultsChan <- sectionResult{err: fmt.Errorf("dial %s: %w", address, err)}
+			if err := client.Call("GOLWorker.Step", stepReq, &stepRes); err != nil {
+				resultsChan <- sectionResult{err: fmt.Errorf("Step RPC %s: %w", address, err)}
 				return
 			}
 
 			resultsChan <- sectionResult{
-				start: sectionRes.StartY,
-				rows:  sectionRes.Section,
+				start: stepRes.StartY,
+				rows:  stepRes.Section,
 				err:   nil,
 			}
-
-		}()
+		}(sec, address)
 	}
 
 	results := make([]sectionResult, numWorkers)
 	for i := 0; i < numWorkers; i++ {
-		results[i] = <-resultsChan
+		r := <-resultsChan
+		if r.err != nil {
+			return r.err
+		}
+		results[i] = r
 	}
-
 	close(resultsChan)
 
-	// build new world from the individual sections
-	newWorld := make([][]byte, p.ImageHeight)
-	for _, result := range results {
-		for i, row := range result.rows {
-			newWorld[result.start+i] = row
+	// Stitch full world
+	newWorld := make([][]byte, params.ImageHeight)
+	for _, r := range results {
+		for i, row := range r.rows {
+			y := r.start + i
+			newWorld[y] = row
 		}
 	}
 
+	// 🔐 Update turn + alive under lock so GetAliveCount sees a consistent snapshot
+	broker.mu.Lock()
 	broker.turn++
 	broker.alive = countAlive(newWorld)
+	broker.mu.Unlock()
 
 	res.World = newWorld
 	return nil
 }
 
+// allows distributor to request the current count from the broker
+// broker has access to the most recent number of alive cells in the world
 func (broker *Broker) GetAliveCount(_ struct{}, out *int) error {
+	broker.mu.RLock()
 	*out = broker.alive
+	broker.mu.RUnlock()
 	return nil
 }
 
@@ -178,6 +284,7 @@ func (broker *Broker) KillWorkers(_ gol.Empty, _ *gol.Empty) error {
 	}
 
 	go os.Exit(0)
+
 	return nil
 }
 
@@ -185,7 +292,8 @@ func main() {
 
 	broker := &Broker{
 		workerAddresses: []string{
-			"3.91.156.154:8030",
+			// CAN ALWAYS CHANGE
+			"127.0.0.1:8030",
 		},
 	}
 
@@ -198,6 +306,7 @@ func main() {
 	}
 
 	listener, err := net.Listen("tcp4", "0.0.0.0:8040")
+
 	if err != nil {
 		fmt.Println("Error starting listener:", err)
 		os.Exit(1)
@@ -216,3 +325,4 @@ func main() {
 		go rpc.ServeConn(conn)
 	}
 }
+

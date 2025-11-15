@@ -293,7 +293,8 @@ func main() {
 	broker := &Broker{
 		workerAddresses: []string{
 			// CAN ALWAYS CHANGE
-			"127.0.0.1:8030",
+			"172.31.30.142:8030",
+			"172.31.30.21:8030",
 		},
 	}
 

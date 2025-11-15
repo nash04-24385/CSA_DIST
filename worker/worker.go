@@ -23,26 +23,17 @@ type GOLWorker struct {
 	// local slice of the world (height = endY-startY, width = params.ImageWidth)
 	localWorld [][]byte
 
-	// halo rows received from neighbours (length = params.ImageWidth)
-	topHalo    []byte
-	bottomHalo []byte
-
 	// neighbour worker addresses ("ip:port"), empty string if no neighbour
 	aboveAddr string
 	belowAddr string
-
-	// to sync halo state
-
-	haloExpected int        // how many halo messages we expect this gen (1 or 2)
-	haloReceived int        // how many we've received for this gen
-	condition    *sync.Cond // condition variable based on mu
 }
 
 // -----------------------------------------------------------------------------
-// Baseline method (current implementation) - still here if you need it
+// Baseline method (full-world resync) - kept for compatibility
 // -----------------------------------------------------------------------------
 
-// process the section the broker gives (baseline, full-world resync)
+// ProcessSection is the old, non-halo version: broker sends full world, worker
+// computes [startY,endY) using the global world.
 func (w *GOLWorker) ProcessSection(req gol.SectionRequest, res *gol.SectionResponse) error {
 	p := req.Params
 	world := req.World
@@ -57,7 +48,7 @@ func (w *GOLWorker) ProcessSection(req gol.SectionRequest, res *gol.SectionRespo
 }
 
 // -----------------------------------------------------------------------------
-// New: Initialisation for halo-exchange mode
+// Initialisation for halo-exchange mode
 // -----------------------------------------------------------------------------
 
 // InitSection is called once by the broker to give this worker its slice
@@ -78,15 +69,8 @@ func (w *GOLWorker) InitSection(req gol.WorkerInitRequest, _ *struct{}) error {
 		copy(w.localWorld[i], req.LocalWorld[i])
 	}
 
-	w.topHalo = make([]byte, w.params.ImageWidth)
-	w.bottomHalo = make([]byte, w.params.ImageWidth)
-
 	w.aboveAddr = req.AboveAddr
 	w.belowAddr = req.BelowAddr
-
-	// reset sync state
-	w.haloReceived = 0
-	w.haloReceived = 0
 
 	fmt.Printf("Worker [%d,%d) initialised. Above=%q Below=%q\n",
 		w.startY, w.endY, w.aboveAddr, w.belowAddr)
@@ -95,66 +79,54 @@ func (w *GOLWorker) InitSection(req gol.WorkerInitRequest, _ *struct{}) error {
 }
 
 // -----------------------------------------------------------------------------
-// New: Halo receiver RPCs (neighbours call these)
+// New: boundary getter RPCs (neighbours PULL these)
 // -----------------------------------------------------------------------------
 
-func (w *GOLWorker) SetTopHalo(req gol.HaloRow, _ *struct{}) error {
-	w.mu.Lock()
-	defer w.mu.Unlock()
+// GetTopBoundary returns a copy of this worker's top local row.
+func (w *GOLWorker) GetTopBoundary(_ struct{}, res *gol.HaloRow) error {
+	w.mu.RLock()
+	defer w.mu.RUnlock()
 
-	//debug
-	if len(req.Row) != w.params.ImageWidth {
-		return fmt.Errorf("SetTopHalo: wrong row width %d, expected %d",
-			len(req.Row), w.params.ImageWidth)
+	if len(w.localWorld) == 0 {
+		res.Row = nil
+		return nil
 	}
 
-	copy(w.topHalo, req.Row)
-	w.haloReceived++
-	//DEBUG
-	fmt.Printf("[WORKER Halo] SetTopHalo range=[%d,%d) received=%d/%d\n",
-		w.startY, w.endY, w.haloReceived, w.haloExpected)
-	
-	if w.haloReceived >= w.haloExpected {
-		w.condition.Broadcast()
-	}
-
+	width := w.params.ImageWidth
+	row := make([]byte, width)
+	copy(row, w.localWorld[0])
+	res.Row = row
 	return nil
 }
 
-func (w *GOLWorker) SetBottomHalo(req gol.HaloRow, _ *struct{}) error {
-	w.mu.Lock()
-	defer w.mu.Unlock()
+// GetBottomBoundary returns a copy of this worker's bottom local row.
+func (w *GOLWorker) GetBottomBoundary(_ struct{}, res *gol.HaloRow) error {
+	w.mu.RLock()
+	defer w.mu.RUnlock()
 
-	// debug
-	if len(req.Row) != w.params.ImageWidth {
-		return fmt.Errorf("SetBottomHalo: wrong row width %d, expected %d",
-			len(req.Row), w.params.ImageWidth)
+	if len(w.localWorld) == 0 {
+		res.Row = nil
+		return nil
 	}
 
-	copy(w.bottomHalo, req.Row)
-	w.haloReceived++
-	//DEBUG
-	fmt.Printf("[WORKER Halo] SetTopHalo range=[%d,%d) received=%d/%d\n",
-		w.startY, w.endY, w.haloReceived, w.haloExpected)
-	
-	if w.haloReceived >= w.haloExpected {
-		w.condition.Broadcast()
-	}
-
+	width := w.params.ImageWidth
+	h := len(w.localWorld)
+	row := make([]byte, width)
+	copy(row, w.localWorld[h-1])
+	res.Row = row
 	return nil
 }
 
 // -----------------------------------------------------------------------------
-// New: Single "Step" for one Game of Life iteration using halos
+// New: Single "Step" for one Game of Life iteration using PULL halos
 // -----------------------------------------------------------------------------
 
 // Step performs one GoL iteration:
-//  1. Send our boundary rows to neighbours (halo exchange).
-//  2. Wait for neighbours to update our halo rows via SetTopHalo/SetBottomHalo.
-//  3. Compute next local slice using localWorld + halos.
-//  4. Return updated slice to broker.
+//  1. Pull boundary rows from neighbours via GetTop/BottomBoundary.
+//  2. Compute next local slice using localWorld + pulled halos.
+//  3. Return updated slice to broker.
 func (w *GOLWorker) Step(_ struct{}, res *gol.SectionResponse) error {
-	// 1. Capture current boundaries + neighbour addresses under read lock
+	// 1. Snapshot parameters under read lock
 	w.mu.RLock()
 	if w.localWorld == nil {
 		w.mu.RUnlock()
@@ -164,107 +136,66 @@ func (w *GOLWorker) Step(_ struct{}, res *gol.SectionResponse) error {
 	height := len(w.localWorld)
 	width := w.params.ImageWidth
 
-	// copy boundaries from current localworld
-	topBoundary := make([]byte, width)
-	bottomBoundary := make([]byte, width)
-	copy(topBoundary, w.localWorld[0])
-	copy(bottomBoundary, w.localWorld[height-1])
-
 	aboveAddr := w.aboveAddr
 	belowAddr := w.belowAddr
 	startY := w.startY
 	params := w.params
 
-	//how many halos to receive this turn
-	neighbours := 0
-	if aboveAddr != "" {
-		neighbours++
-	}
-	if belowAddr != "" {
-		neighbours++
-	}
-
-	w.haloExpected = neighbours
-	w.haloReceived = 0
-
-	// DEBUG
-	fmt.Printf("[WORKER Step] start range=[%d,%d) neighbours=%d expected=%d\n",
-		startY, startY+height, neighbours, w.haloExpected)
-
 	w.mu.RUnlock()
 
-	// 2. Send our boundaries to neighbours (if they exist)
-	var wg sync.WaitGroup
+	_ = height // only used conceptually; not needed directly here
 
+	// 2. Pull halos from neighbours
+	var topHalo, bottomHalo []byte
+
+	// Get bottom boundary of worker above (wrap-around neighbour)
 	if aboveAddr != "" {
-		wg.Add(1)
-		go func(addr string, row []byte) {
-			defer wg.Done()
-			client, err := rpc.Dial("tcp", addr)
-			if err != nil {
-				fmt.Println("Step: failed to dial above neighbour:", err)
-				return
-			}
-			defer client.Close()
-
-			req := gol.HaloRow{Row: row}
-			var reply struct{}
-			if err := client.Call("GOLWorker.SetBottomHalo", req, &reply); err != nil {
-				fmt.Println("Step: SetBottomHalo RPC failed:", err)
-			}
-		}(aboveAddr, topBoundary)
-	}
-
-	if belowAddr != "" {
-		wg.Add(1)
-		go func(addr string, row []byte) {
-			defer wg.Done()
-			client, err := rpc.Dial("tcp", addr)
-			if err != nil {
-				fmt.Println("Step: failed to dial below neighbour:", err)
-				return
-			}
-			defer client.Close()
-
-			req := gol.HaloRow{Row: row}
-			var reply struct{}
-			if err := client.Call("GOLWorker.SetTopHalo", req, &reply); err != nil {
-				fmt.Println("Step: SetTopHalo RPC failed:", err)
-			}
-		}(belowAddr, bottomBoundary)
-	}
-
-	// wait for our outbound halo messages to be sent
-	wg.Wait()
-
-	// 3. Now that our halos should be set, compute next local slice
-	w.mu.Lock()
-
-	for w.haloReceived < w.haloExpected {
-		if w.haloExpected == 0 {
-			break
+		client, err := rpc.Dial("tcp", aboveAddr)
+		if err != nil {
+			fmt.Println("Step: failed to dial above neighbour:", err)
+			return err
 		}
-		fmt.Printf("[WORKER Step] start range=[%d,%d) neighbours=%d expected=%d\n",
-			startY, startY+height, neighbours, w.haloExpected)
-
-		w.condition.Wait()
+		var reply gol.HaloRow
+		if err := client.Call("GOLWorker.GetBottomBoundary", struct{}{}, &reply); err != nil {
+			fmt.Println("Step: GetBottomBoundary RPC failed:", err)
+			client.Close()
+			return err
+		}
+		client.Close()
+		topHalo = reply.Row
 	}
 
-	// 4. Now halos are up to date for this gen
-	newLocal := calculateNextUsingHalos(params, w.localWorld, w.topHalo, w.bottomHalo)
+	// Get top boundary of worker below
+	if belowAddr != "" {
+		client, err := rpc.Dial("tcp", belowAddr)
+		if err != nil {
+			fmt.Println("Step: failed to dial below neighbour:", err)
+			return err
+		}
+		var reply gol.HaloRow
+		if err := client.Call("GOLWorker.GetTopBoundary", struct{}{}, &reply); err != nil {
+			fmt.Println("Step: GetTopBoundary RPC failed:", err)
+			client.Close()
+			return err
+		}
+		client.Close()
+		bottomHalo = reply.Row
+	}
+
+	// 3. Compute next local slice using halos
+	w.mu.Lock()
+	newLocal := calculateNextUsingHalos(params, w.localWorld, topHalo, bottomHalo)
 	w.localWorld = newLocal
 
 	// prepare response for broker
 	res.StartY = startY
-
-	// deep copy for safety
 	res.Section = make([][]byte, len(newLocal))
 	for i := range newLocal {
 		res.Section[i] = make([]byte, width)
 		copy(res.Section[i], newLocal[i])
 	}
-	w.mu.Unlock()
 
+	w.mu.Unlock()
 	return nil
 }
 
@@ -334,7 +265,7 @@ func calculateNextStatesFullWorld(p gol.Params, world [][]byte, startY, endY int
 	return newRows
 }
 
-// New helper: uses localWorld + halos instead of full world
+// New helper: uses localWorld + halos instead of full world.
 // localWorld has shape [hLocal][w], topHalo & bottomHalo are length w.
 func calculateNextUsingHalos(p gol.Params, localWorld [][]byte, topHalo, bottomHalo []byte) [][]byte {
 	hLocal := len(localWorld)
@@ -417,7 +348,7 @@ func calculateNextUsingHalos(p gol.Params, localWorld [][]byte, topHalo, bottomH
 }
 
 // -----------------------------------------------------------------------------
-// Shutdown + main unchanged
+// Shutdown + main
 // -----------------------------------------------------------------------------
 
 // helper func to make worker shut down on keypress
@@ -431,7 +362,6 @@ func (w *GOLWorker) Shutdown(_ struct{}, _ *struct{}) error {
 
 func main() {
 	worker := &GOLWorker{}
-	worker.condition = sync.NewCond(&worker.mu)
 
 	if err := rpc.RegisterName("GOLWorker", worker); err != nil {
 		fmt.Println("Error registering RPC:", err)

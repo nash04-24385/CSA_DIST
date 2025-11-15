@@ -60,6 +60,13 @@ func assignSections(height, workers int) []section {
 		// start is updated for the next worker
 		start = end
 	}
+
+	//DEBUG
+	fmt.Println("[BROKER] assignSections result:")
+	for i, s := range sections {
+		fmt.Printf("  worker %d: [%d,%d) (height %d)\n", i, s.start, s.end, s.end-s.start)
+	}
+
 	return sections
 }
 
@@ -245,7 +252,11 @@ func (broker *Broker) ProcessSection(req gol.BrokerRequest, res *gol.BrokerRespo
 		}
 	}
 
-	// 🔐 Update turn + alive under lock so GetAliveCount sees a consistent snapshot
+	// DEBUG
+	golden := debugSequentialStep(params, req.World)
+	debugCompareWorlds(broker.turn+1, newWorld, golden)
+
+	// Update turn + alive under lock so GetAliveCount sees a consistent snapshot
 	broker.mu.Lock()
 	broker.turn++
 	broker.alive = countAlive(newWorld)
@@ -288,6 +299,94 @@ func (broker *Broker) KillWorkers(_ gol.Empty, _ *gol.Empty) error {
 	return nil
 }
 
+// debugSequentialStep computes the next world state using the original
+// full-world GoL rules (no distribution, no halos). We use this to
+// check that the distributed halo version is behaving identically.
+func debugSequentialStep(p gol.Params, world [][]byte) [][]byte {
+	h := p.ImageHeight
+	w := p.ImageWidth
+
+	next := make([][]byte, h)
+	for y := 0; y < h; y++ {
+		next[y] = make([]byte, w)
+	}
+
+	for i := 0; i < h; i++ {
+		for j := 0; j < w; j++ {
+			count := 0
+
+			up := (i - 1 + h) % h
+			down := (i + 1) % h
+			left := (j - 1 + w) % w
+			right := (j + 1) % w
+
+			if world[i][left] == 255 {
+				count++
+			}
+			if world[i][right] == 255 {
+				count++
+			}
+			if world[up][j] == 255 {
+				count++
+			}
+			if world[down][j] == 255 {
+				count++
+			}
+			if world[up][right] == 255 {
+				count++
+			}
+			if world[up][left] == 255 {
+				count++
+			}
+			if world[down][right] == 255 {
+				count++
+			}
+			if world[down][left] == 255 {
+				count++
+			}
+
+			if world[i][j] == 255 {
+				if count == 2 || count == 3 {
+					next[i][j] = 255
+				} else {
+					next[i][j] = 0
+				}
+			} else {
+				if count == 3 {
+					next[i][j] = 255
+				} else {
+					next[i][j] = 0
+				}
+			}
+		}
+	}
+
+	return next
+}
+
+// helper to compare two worlds and print the first mismatch
+func debugCompareWorlds(turn int, a, b [][]byte) {
+	if len(a) != len(b) {
+		fmt.Printf("[DEBUG] world mismatch at turn %d: different heights %d vs %d\n",
+			turn, len(a), len(b))
+		return
+	}
+	for y := range a {
+		if len(a[y]) != len(b[y]) {
+			fmt.Printf("[DEBUG] world mismatch at turn %d: row %d length %d vs %d\n",
+				turn, y, len(a[y]), len(b[y]))
+			return
+		}
+		for x := range a[y] {
+			if a[y][x] != b[y][x] {
+				fmt.Printf("[DEBUG] first cell mismatch at turn %d: (x=%d,y=%d) dist=%d seq=%d\n",
+					turn, x, y, a[y][x], b[y][x])
+				return
+			}
+		}
+	}
+}
+
 func main() {
 
 	broker := &Broker{
@@ -326,4 +425,3 @@ func main() {
 		go rpc.ServeConn(conn)
 	}
 }
-

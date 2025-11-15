@@ -11,5 +11,6 @@ type WorkerInitRequest struct {
 }
 
 type HaloRow struct {
-	Row []byte
+	Row   []byte
+	GenID int //generation ID for this step
 }

@@ -32,7 +32,7 @@ type GOLWorker struct {
 	belowAddr string
 
 	// to sync halo state
-	haloGenID    int        // current generation number
+
 	haloExpected int        // how many halo messages we expect this gen (1 or 2)
 	haloReceived int        // how many we've received for this gen
 	condition    *sync.Cond // condition variable based on mu
@@ -85,7 +85,6 @@ func (w *GOLWorker) InitSection(req gol.WorkerInitRequest, _ *struct{}) error {
 	w.belowAddr = req.BelowAddr
 
 	// reset sync state
-	w.haloGenID = 0
 	w.haloReceived = 0
 	w.haloReceived = 0
 
@@ -103,11 +102,6 @@ func (w *GOLWorker) SetTopHalo(req gol.HaloRow, _ *struct{}) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
-	//ignore very stale generations
-	if req.GenID < w.haloGenID {
-		return nil
-	}
-
 	//debug
 	if len(req.Row) != w.params.ImageWidth {
 		return fmt.Errorf("SetTopHalo: wrong row width %d, expected %d",
@@ -115,11 +109,9 @@ func (w *GOLWorker) SetTopHalo(req gol.HaloRow, _ *struct{}) error {
 	}
 
 	copy(w.topHalo, req.Row)
-	if req.GenID == w.haloGenID {
-		w.haloReceived++
-		if w.haloReceived >= w.haloExpected {
-			w.condition.Broadcast()
-		}
+	w.haloReceived++
+	if w.haloReceived >= w.haloExpected {
+		w.condition.Broadcast()
 	}
 
 	return nil
@@ -129,11 +121,6 @@ func (w *GOLWorker) SetBottomHalo(req gol.HaloRow, _ *struct{}) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
-	//ignore very stale generations
-	if req.GenID < w.haloGenID {
-		return nil
-	}
-
 	// debug
 	if len(req.Row) != w.params.ImageWidth {
 		return fmt.Errorf("SetBottomHalo: wrong row width %d, expected %d",
@@ -141,11 +128,9 @@ func (w *GOLWorker) SetBottomHalo(req gol.HaloRow, _ *struct{}) error {
 	}
 
 	copy(w.bottomHalo, req.Row)
-	if req.GenID == w.haloGenID {
-		w.haloReceived++
-		if w.haloReceived >= w.haloExpected {
-			w.condition.Broadcast()
-		}
+	w.haloReceived++
+	if w.haloReceived >= w.haloExpected {
+		w.condition.Broadcast()
 	}
 
 	return nil
@@ -182,10 +167,6 @@ func (w *GOLWorker) Step(_ struct{}, res *gol.SectionResponse) error {
 	startY := w.startY
 	params := w.params
 
-	//set up new gen
-	w.haloGenID++
-	gen := w.haloGenID
-
 	//how many halos to receive this turn
 	neighbours := 0
 	if aboveAddr != "" {
@@ -205,7 +186,7 @@ func (w *GOLWorker) Step(_ struct{}, res *gol.SectionResponse) error {
 
 	if aboveAddr != "" {
 		wg.Add(1)
-		go func(addr string, row []byte, g int) {
+		go func(addr string, row []byte) {
 			defer wg.Done()
 			client, err := rpc.Dial("tcp", addr)
 			if err != nil {
@@ -214,17 +195,17 @@ func (w *GOLWorker) Step(_ struct{}, res *gol.SectionResponse) error {
 			}
 			defer client.Close()
 
-			req := gol.HaloRow{GenID: g, Row: row}
+			req := gol.HaloRow{Row: row}
 			var reply struct{}
 			if err := client.Call("GOLWorker.SetBottomHalo", req, &reply); err != nil {
 				fmt.Println("Step: SetBottomHalo RPC failed:", err)
 			}
-		}(aboveAddr, topBoundary, gen)
+		}(aboveAddr, topBoundary)
 	}
 
 	if belowAddr != "" {
 		wg.Add(1)
-		go func(addr string, row []byte, g int) {
+		go func(addr string, row []byte) {
 			defer wg.Done()
 			client, err := rpc.Dial("tcp", addr)
 			if err != nil {
@@ -233,12 +214,12 @@ func (w *GOLWorker) Step(_ struct{}, res *gol.SectionResponse) error {
 			}
 			defer client.Close()
 
-			req := gol.HaloRow{GenID: g, Row: row}
+			req := gol.HaloRow{Row: row}
 			var reply struct{}
 			if err := client.Call("GOLWorker.SetTopHalo", req, &reply); err != nil {
 				fmt.Println("Step: SetTopHalo RPC failed:", err)
 			}
-		}(belowAddr, bottomBoundary, gen)
+		}(belowAddr, bottomBoundary)
 	}
 
 	// wait for our outbound halo messages to be sent
@@ -248,7 +229,9 @@ func (w *GOLWorker) Step(_ struct{}, res *gol.SectionResponse) error {
 	w.mu.Lock()
 
 	for w.haloReceived < w.haloExpected {
-		// if there are no neighbours, haloExpected == 0, loop won't run
+		if w.haloExpected == 0 {
+			break
+		}
 		w.condition.Wait()
 	}
 

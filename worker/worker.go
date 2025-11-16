@@ -10,6 +10,19 @@ import (
 	"uk.ac.bris.cs/gameoflife/gol"
 )
 
+// DEBUGGING
+func debugRowBits(label string, row []byte) {
+	fmt.Print(label, " ")
+	for _, v := range row {
+		if v == 255 {
+			fmt.Print("1")
+		} else {
+			fmt.Print("0")
+		}
+	}
+	fmt.Println()
+}
+
 type GOLWorker struct {
 	mu sync.RWMutex
 
@@ -111,6 +124,10 @@ func (w *GOLWorker) SetTopHalo(req gol.HaloRow, _ *struct{}) error {
 	}
 	copy(w.topHalo, req.Row)
 
+	//DEBUG
+	fmt.Printf("[WORKER DEBUG] SetTopHalo for worker [%d, %d]\n", w.startY, w.endY)
+	debugRowBits(" topHalo =", w.topHalo)
+
 	w.halosReceived++
 	if w.cond != nil && w.halosReceived >= w.halosExpected {
 		w.cond.Broadcast()
@@ -132,6 +149,10 @@ func (w *GOLWorker) SetBottomHalo(req gol.HaloRow, _ *struct{}) error {
 	}
 	copy(w.bottomHalo, req.Row)
 
+	//DEBUG
+	fmt.Printf("[WORKER DEBUG] SetBottomHalo for worker [%d, %d]\n", w.startY, w.endY)
+	debugRowBits(" bottomHalo =", w.bottomHalo)
+
 	w.halosReceived++
 	if w.cond != nil && w.halosReceived >= w.halosExpected {
 		w.cond.Broadcast()
@@ -144,11 +165,11 @@ func (w *GOLWorker) SetBottomHalo(req gol.HaloRow, _ *struct{}) error {
 // -----------------------------------------------------------------------------
 
 // Step performs one GoL iteration with PUSH-based halo exchange:
-//   1. Snapshot our top and bottom rows from localWorld (generation t).
-//   2. Send those rows to neighbours via SetTopHalo/SetBottomHalo RPCs.
-//   3. Wait until both halos have been received (barrier).
-//   4. Compute next local slice using localWorld + topHalo + bottomHalo.
-//   5. Return updated slice to broker.
+//  1. Snapshot our top and bottom rows from localWorld (generation t).
+//  2. Send those rows to neighbours via SetTopHalo/SetBottomHalo RPCs.
+//  3. Wait until both halos have been received (barrier).
+//  4. Compute next local slice using localWorld + topHalo + bottomHalo.
+//  5. Return updated slice to broker.
 func (w *GOLWorker) Step(_ struct{}, res *gol.SectionResponse) error {
 	// 1. Snapshot parameters and boundary rows under read lock
 	w.mu.RLock()
@@ -243,6 +264,17 @@ func (w *GOLWorker) Step(_ struct{}, res *gol.SectionResponse) error {
 			break
 		}
 		w.cond.Wait()
+	}
+
+	// DEBUG: for the 16x16 case we care about the boundary worker [8,16)
+	if w.startY == 8 && len(w.localWorld) >= 2 {
+		fmt.Println("[WORKER DEBUG] computing boundary for worker [8,16)")
+
+		// local index 0 is global row 8
+		debugRowBits("  rowUp (topHalo)   =", w.topHalo)
+		debugRowBits("  row0 localWorld   =", w.localWorld[0])
+		debugRowBits("  row1 localWorld   =", w.localWorld[1])
+		debugRowBits("  rowDown(bottomHalo)=", w.bottomHalo)
 	}
 
 	// compute next local slice using localWorld (gen t) and the halos (also gen t)
@@ -449,3 +481,4 @@ func main() {
 		go rpc.ServeConn(conn)
 	}
 }
+

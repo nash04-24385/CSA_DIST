@@ -10,447 +10,240 @@ import (
 	"uk.ac.bris.cs/gameoflife/gol"
 )
 
-// DEBUGGING
-func debugRowBits(label string, row []byte) {
-	fmt.Print(label, " ")
-	for _, v := range row {
-		if v == 255 {
-			fmt.Print("1")
-		} else {
-			fmt.Print("0")
-		}
-	}
-	fmt.Println()
-}
-
 type GOLWorker struct {
-	mu sync.RWMutex
+	mu   sync.RWMutex
+	cond *sync.Cond
 
-	// persistent configuration
 	params gol.Params
 
-	// global row range this worker owns: [startY, endY)
 	startY int
 	endY   int
 
-	// local slice of the world (height = endY-startY, width = params.ImageWidth)
 	localWorld [][]byte
 
-	// neighbour worker addresses ("ip:port"), empty string if no neighbour
 	aboveAddr string
 	belowAddr string
 
-	// --- halo exchange state (push + barrier) ---
 	topHalo    []byte
 	bottomHalo []byte
 
-	halosExpected int // how many halos we expect this turn (0,1,2)
-	halosReceived int // how many we’ve actually received
-
-	cond *sync.Cond // condition variable to wait until halosReceived == halosExpected
+	halosExpected int
+	halosReceived int
 }
 
 // -----------------------------------------------------------------------------
-// Baseline method (full-world resync) - kept for compatibility
+// INIT (called once)
 // -----------------------------------------------------------------------------
 
-// ProcessSection is the old, non-halo version: broker sends full world, worker
-// computes [startY,endY) using the global world.
-func (w *GOLWorker) ProcessSection(req gol.SectionRequest, res *gol.SectionResponse) error {
-	p := req.Params
-	world := req.World
-	startY := req.StartY
-	endY := req.EndY
-
-	updatedSection := calculateNextStatesFullWorld(p, world, startY, endY)
-
-	res.StartY = startY
-	res.Section = updatedSection
-	return nil
-}
-
-// -----------------------------------------------------------------------------
-// Initialisation for halo-exchange mode
-// -----------------------------------------------------------------------------
-
-// InitSection is called once by the broker to give this worker its slice
-// and neighbour addresses.
 func (w *GOLWorker) InitSection(req gol.WorkerInitRequest, _ *struct{}) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
-	w.params = req.Params
 	w.startY = req.StartY
 	w.endY = req.EndY
-
-	// Make a deep copy of the local slice so we own it
-	h := req.EndY - req.StartY
-	w.localWorld = make([][]byte, h)
-	for i := 0; i < h; i++ {
-		w.localWorld[i] = make([]byte, w.params.ImageWidth)
-		copy(w.localWorld[i], req.LocalWorld[i])
-	}
-
+	w.params = req.Params
 	w.aboveAddr = req.AboveAddr
 	w.belowAddr = req.BelowAddr
 
-	// allocate halo buffers
-	w.topHalo = make([]byte, w.params.ImageWidth)
-	w.bottomHalo = make([]byte, w.params.ImageWidth)
-	w.halosExpected = 0
-	w.halosReceived = 0
+	h := req.EndY - req.StartY
+	//wid := req.Params.ImageWidth
 
-	fmt.Printf("Worker [%d,%d) initialised. Above=%q Below=%q\n",
+	// Deep-copy worker slice
+	w.localWorld = make([][]byte, h)
+	for i := 0; i < h; i++ {
+		w.localWorld[i] = append([]byte(nil), req.LocalWorld[i]...)
+	}
+
+	// Allocate halos and copy initial global rows
+	w.topHalo = append([]byte(nil), req.TopInitial...)
+	w.bottomHalo = append([]byte(nil), req.BottomInitial...)
+
+	if w.cond == nil {
+		w.cond = sync.NewCond(&w.mu)
+	}
+
+	fmt.Printf("Worker [%d,%d) initialized (above=%s below=%s)\n",
 		w.startY, w.endY, w.aboveAddr, w.belowAddr)
 
 	return nil
 }
 
 // -----------------------------------------------------------------------------
-// Halo RPCs: neighbours PUSH their boundary rows to us
+// Halo RPCs (called by neighbours)
 // -----------------------------------------------------------------------------
 
-// SetTopHalo: neighbour sends a row that will be used as the "row above" our localWorld[0]
 func (w *GOLWorker) SetTopHalo(req gol.HaloRow, _ *struct{}) error {
 	w.mu.Lock()
-	defer w.mu.Unlock()
-
-	if len(req.Row) == 0 {
-		return nil
-	}
-
-	if w.topHalo == nil || len(w.topHalo) != len(req.Row) {
-		w.topHalo = make([]byte, len(req.Row))
-	}
-	copy(w.topHalo, req.Row)
-
-	//DEBUG
-	fmt.Printf("[WORKER DEBUG] SetTopHalo for worker [%d, %d]\n", w.startY, w.endY)
-	debugRowBits(" topHalo =", w.topHalo)
-
+	w.topHalo = append([]byte(nil), req.Row...)
+	//copy(w.topHalo, req.Row)
 	w.halosReceived++
-	if w.cond != nil && w.halosReceived >= w.halosExpected {
-		w.cond.Broadcast()
-	}
+	w.cond.Broadcast()
+	w.mu.Unlock()
 	return nil
 }
 
-// SetBottomHalo: neighbour sends a row that will be used as the "row below" our localWorld[hLocal-1]
 func (w *GOLWorker) SetBottomHalo(req gol.HaloRow, _ *struct{}) error {
 	w.mu.Lock()
-	defer w.mu.Unlock()
-
-	if len(req.Row) == 0 {
-		return nil
-	}
-
-	if w.bottomHalo == nil || len(w.bottomHalo) != len(req.Row) {
-		w.bottomHalo = make([]byte, len(req.Row))
-	}
-	copy(w.bottomHalo, req.Row)
-
-	//DEBUG
-	fmt.Printf("[WORKER DEBUG] SetBottomHalo for worker [%d, %d]\n", w.startY, w.endY)
-	debugRowBits(" bottomHalo =", w.bottomHalo)
-
+	w.bottomHalo = append([]byte(nil), req.Row...)
+	//copy(w.bottomHalo, req.Row)
 	w.halosReceived++
-	if w.cond != nil && w.halosReceived >= w.halosExpected {
-		w.cond.Broadcast()
-	}
+	w.cond.Broadcast()
+	w.mu.Unlock()
 	return nil
 }
 
 // -----------------------------------------------------------------------------
-// Single "Step" for one Game of Life iteration using PUSH halos + barrier
+// STEP (one iteration)
 // -----------------------------------------------------------------------------
 
-// Step performs one GoL iteration with PUSH-based halo exchange:
-//  1. Snapshot our top and bottom rows from localWorld (generation t).
-//  2. Send those rows to neighbours via SetTopHalo/SetBottomHalo RPCs.
-//  3. Wait until both halos have been received (barrier).
-//  4. Compute next local slice using localWorld + topHalo + bottomHalo.
-//  5. Return updated slice to broker.
-func (w *GOLWorker) Step(_ struct{}, res *gol.SectionResponse) error {
-	// 1. Snapshot parameters and boundary rows under read lock
-	w.mu.RLock()
-	if w.localWorld == nil {
-		w.mu.RUnlock()
-		return fmt.Errorf("Step called before InitSection")
-	}
+func (w *GOLWorker) Step(_ struct{}, resp *gol.SectionResponse) error {
 
-	height := len(w.localWorld)
-	width := w.params.ImageWidth
-	if height == 0 {
-		w.mu.RUnlock()
-		return fmt.Errorf("Step called with empty localWorld")
-	}
-
-	aboveAddr := w.aboveAddr
-	belowAddr := w.belowAddr
-	startY := w.startY
-	params := w.params
-
-	// copy our boundary rows (gen t)
-	topRow := make([]byte, width)
-	bottomRow := make([]byte, width)
-	copy(topRow, w.localWorld[0])
-	copy(bottomRow, w.localWorld[height-1])
-
-	w.mu.RUnlock()
-
-	// 2. Reset halo state for this turn
 	w.mu.Lock()
 
-	// ensure halo buffers are allocated
-	if w.topHalo == nil || len(w.topHalo) != width {
-		w.topHalo = make([]byte, width)
-	}
-	if w.bottomHalo == nil || len(w.bottomHalo) != width {
-		w.bottomHalo = make([]byte, width)
+	if w.localWorld == nil {
+		w.mu.Unlock()
+		return fmt.Errorf("Step() before InitSection")
 	}
 
-	w.halosExpected = 0
+	hLocal := len(w.localWorld)
+	//wid := w.params.ImageWidth
+
+	// Snapshot boundary rows
+	topRow := append([]byte(nil), w.localWorld[0]...)
+	bottomRow := append([]byte(nil), w.localWorld[hLocal-1]...)
+
+	// TOROIDAL GRID → always expect 2 halos
+	w.halosExpected = 2
 	w.halosReceived = 0
 
-	if aboveAddr != "" {
-		w.halosExpected++
-	}
-	if belowAddr != "" {
-		w.halosExpected++
-	}
+	above := w.aboveAddr
+	below := w.belowAddr
 
-	// if no neighbours (very degenerate), we won't wait
 	w.mu.Unlock()
 
-	// 3. Push our boundaries to neighbours (no lock held)
-
-	// send TOP row to the worker ABOVE → they store it as their bottomHalo
-	if aboveAddr != "" {
-		client, err := rpc.Dial("tcp", aboveAddr)
-		if err != nil {
-			fmt.Println("Step: failed to dial above neighbour:", err)
-			return err
+	// SEND HALOS
+	if above != "" {
+		if c, err := rpc.Dial("tcp", above); err == nil {
+			// I am directly BELOW 'above' worker:
+			// my top row is the row just under their last row → their bottom halo
+			_ = c.Call("GOLWorker.SetBottomHalo", gol.HaloRow{Row: topRow}, nil)
+			c.Close()
 		}
-		var reply struct{}
-		if err := client.Call("GOLWorker.SetBottomHalo", gol.HaloRow{Row: topRow}, &reply); err != nil {
-			fmt.Println("Step: SetBottomHalo RPC failed (above):", err)
-			client.Close()
-			return err
-		}
-		client.Close()
 	}
 
-	// send BOTTOM row to the worker BELOW → they store it as their topHalo
-	if belowAddr != "" {
-		client, err := rpc.Dial("tcp", belowAddr)
-		if err != nil {
-			fmt.Println("Step: failed to dial below neighbour:", err)
-			return err
+	if below != "" {
+		if c, err := rpc.Dial("tcp", below); err == nil {
+			// I am directly ABOVE 'below' worker:
+			// my bottom row is the row just above their first row → their top halo
+			_ = c.Call("GOLWorker.SetTopHalo", gol.HaloRow{Row: bottomRow}, nil)
+			c.Close()
 		}
-		var reply struct{}
-		if err := client.Call("GOLWorker.SetTopHalo", gol.HaloRow{Row: bottomRow}, &reply); err != nil {
-			fmt.Println("Step: SetTopHalo RPC failed (below):", err)
-			client.Close()
-			return err
-		}
-		client.Close()
 	}
 
-	// 4. Wait until we have received all halos for this turn
+	// ------------ WAIT FOR BOTH HALOS ------------
 	w.mu.Lock()
 	for w.halosReceived < w.halosExpected {
-		if w.cond == nil {
-			// should not happen, but avoid deadlock
-			break
-		}
 		w.cond.Wait()
 	}
 
-	// DEBUG: for the 16x16 case we care about the boundary worker [8,16)
-	if w.startY == 8 && len(w.localWorld) >= 2 {
-		fmt.Println("[WORKER DEBUG] computing boundary for worker [8,16)")
-
-		// local index 0 is global row 8
-		debugRowBits("  rowUp (topHalo)   =", w.topHalo)
-		debugRowBits("  row0 localWorld   =", w.localWorld[0])
-		debugRowBits("  row1 localWorld   =", w.localWorld[1])
-		debugRowBits("  rowDown(bottomHalo)=", w.bottomHalo)
-	}
-
-	// compute next local slice using localWorld (gen t) and the halos (also gen t)
-	newLocal := calculateNextUsingHalos(params, w.localWorld, w.topHalo, w.bottomHalo)
+	// ------------ COMPUTE NEXT LOCAL SLICE ------------
+	newLocal := calculateNextUsingHalos(w.params, w.localWorld, w.topHalo, w.bottomHalo)
 	w.localWorld = newLocal
 
-	// prepare response for broker
-	res.StartY = startY
-	res.Section = make([][]byte, len(newLocal))
+	resp.StartY = w.startY
+	resp.Section = make([][]byte, hLocal)
 	for i := range newLocal {
-		res.Section[i] = make([]byte, width)
-		copy(res.Section[i], newLocal[i])
+		resp.Section[i] = append([]byte(nil), newLocal[i]...)
 	}
-	w.mu.Unlock()
 
+	w.mu.Unlock()
 	return nil
 }
 
 // -----------------------------------------------------------------------------
-// GoL logic
+// GOL Rules (MUST MATCH SEQUENTIAL TESTER EXACTLY)
 // -----------------------------------------------------------------------------
 
-// Baseline helper: uses full world (your original implementation)
-func calculateNextStatesFullWorld(p gol.Params, world [][]byte, startY, endY int) [][]byte {
-	h := p.ImageHeight
-	w := p.ImageWidth
-	rows := endY - startY
+func calculateNextUsingHalos(p gol.Params, local [][]byte, top, bottom []byte) [][]byte {
+	hLocal := len(local)
+	wid := p.ImageWidth
 
-	newRows := make([][]byte, rows)
-	for i := 0; i < rows; i++ {
-		newRows[i] = make([]byte, w)
-	}
-
-	for i := startY; i < endY; i++ {
-		for j := 0; j < w; j++ {
-			count := 0
-			up := (i - 1 + h) % h
-			down := (i + 1) % h
-			left := (j - 1 + w) % w
-			right := (j + 1) % w
-
-			if world[i][left] == 255 {
-				count++
-			}
-			if world[i][right] == 255 {
-				count++
-			}
-			if world[up][j] == 255 {
-				count++
-			}
-			if world[down][j] == 255 {
-				count++
-			}
-			if world[up][right] == 255 {
-				count++
-			}
-			if world[up][left] == 255 {
-				count++
-			}
-			if world[down][right] == 255 {
-				count++
-			}
-			if world[down][left] == 255 {
-				count++
-			}
-
-			if world[i][j] == 255 {
-				if count == 2 || count == 3 {
-					newRows[i-startY][j] = 255
-				} else {
-					newRows[i-startY][j] = 0
-				}
-			} else { // world[i][j] == 0
-				if count == 3 {
-					newRows[i-startY][j] = 255
-				} else {
-					newRows[i-startY][j] = 0
-				}
-			}
-		}
-	}
-	return newRows
-}
-
-// New helper: uses localWorld + halos instead of full world.
-// localWorld has shape [hLocal][w], topHalo & bottomHalo are length w.
-func calculateNextUsingHalos(p gol.Params, localWorld [][]byte, topHalo, bottomHalo []byte) [][]byte {
-	hLocal := len(localWorld)
-	if hLocal == 0 {
-		return nil
-	}
-	w := p.ImageWidth
-
-	newLocal := make([][]byte, hLocal)
+	next := make([][]byte, hLocal)
 	for i := 0; i < hLocal; i++ {
-		newLocal[i] = make([]byte, w)
+		next[i] = make([]byte, wid)
 	}
 
 	for i := 0; i < hLocal; i++ {
-		for j := 0; j < w; j++ {
-			count := 0
+		for j := 0; j < wid; j++ {
 
-			// compute indices with wrap in X
-			left := (j - 1 + w) % w
-			right := (j + 1) % w
+			left := (j - 1 + wid) % wid
+			right := (j + 1) % wid
 
-			// figure out which row is "up" and "down" in the distributed sense
-			var rowUp, rowDown []byte
-
+			var upRow, downRow []byte
 			if i == 0 {
-				rowUp = topHalo
+				upRow = top
 			} else {
-				rowUp = localWorld[i-1]
+				upRow = local[i-1]
 			}
 
 			if i == hLocal-1 {
-				rowDown = bottomHalo
+				downRow = bottom
 			} else {
-				rowDown = localWorld[i+1]
+				downRow = local[i+1]
 			}
 
-			// neighbours:
-			if localWorld[i][left] == 255 {
+			count := 0
+			if local[i][left] == 255 {
 				count++
 			}
-			if localWorld[i][right] == 255 {
+			if local[i][right] == 255 {
 				count++
 			}
-			if rowUp[j] == 255 {
+			if upRow[j] == 255 {
 				count++
 			}
-			if rowDown[j] == 255 {
+			if downRow[j] == 255 {
 				count++
 			}
-			if rowUp[right] == 255 {
+			if upRow[left] == 255 {
 				count++
 			}
-			if rowUp[left] == 255 {
+			if upRow[right] == 255 {
 				count++
 			}
-			if rowDown[right] == 255 {
+			if downRow[left] == 255 {
 				count++
 			}
-			if rowDown[left] == 255 {
+			if downRow[right] == 255 {
 				count++
 			}
 
-			if localWorld[i][j] == 255 {
+			if local[i][j] == 255 {
 				if count == 2 || count == 3 {
-					newLocal[i][j] = 255
+					next[i][j] = 255
 				} else {
-					newLocal[i][j] = 0
+					next[i][j] = 0
 				}
 			} else {
 				if count == 3 {
-					newLocal[i][j] = 255
+					next[i][j] = 255
 				} else {
-					newLocal[i][j] = 0
+					next[i][j] = 0
 				}
 			}
 		}
 	}
 
-	return newLocal
+	return next
 }
 
 // -----------------------------------------------------------------------------
-// Shutdown + main
+// Shutdown and Main
 // -----------------------------------------------------------------------------
 
-// helper func to make worker shut down on keypress
 func (w *GOLWorker) Shutdown(_ struct{}, _ *struct{}) error {
-	fmt.Println("shutdown signal received, stopping worker.")
-	go func() {
-		os.Exit(0)
-	}()
+	fmt.Println("Worker shutting down")
+	go os.Exit(0)
 	return nil
 }
 
@@ -458,27 +251,23 @@ func main() {
 	worker := &GOLWorker{}
 	worker.cond = sync.NewCond(&worker.mu)
 
-	if err := rpc.RegisterName("GOLWorker", worker); err != nil {
-		fmt.Println("Error registering RPC:", err)
-		return
-	}
+	rpc.RegisterName("GOLWorker", worker)
 
-	listener, err := net.Listen("tcp4", "0.0.0.0:8030")
-	if err != nil {
-		fmt.Println("Error starting listener:", err)
-		os.Exit(1)
-		return
+	port := os.Getenv("WORKER_PORT")
+	if port == "" {
+		port = "8030"
 	}
-	fmt.Println("Worker listening on port 8030 (IPv4)...")
-	defer listener.Close()
+	addr := "0.0.0.0:" + port
+
+	ln, err := net.Listen("tcp4", addr)
+	if err != nil {
+		fmt.Println("Worker listen error:", err)
+		os.Exit(1)
+	}
+	fmt.Println("Worker listening on", addr)
 
 	for {
-		conn, err := listener.Accept()
-		if err != nil {
-			fmt.Println("Connection error:", err)
-			continue
-		}
+		conn, _ := ln.Accept()
 		go rpc.ServeConn(conn)
 	}
 }
-

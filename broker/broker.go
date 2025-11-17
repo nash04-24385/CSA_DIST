@@ -5,13 +5,12 @@ import (
 	"net"
 	"net/rpc"
 	"os"
+	"sort"
 	"sync"
 
 	"uk.ac.bris.cs/gameoflife/gol"
 )
 
-// the broker will keep track of the multiple GOLWorkers
-// can use to tell us how many workers we have and then split up the image based on that
 type Broker struct {
 	workerAddresses []string
 	turn            int
@@ -19,11 +18,9 @@ type Broker struct {
 
 	mu sync.RWMutex
 
-	//Added new fields for the halo-exchange implementation
-
-	params      gol.Params // params stores the last Params used to initialise the workers
-	sections    []section  // sections remembers which global row range each worker owns
-	initialised bool       // tells us whether we've already sent initial slices to workers
+	params      gol.Params
+	sections    []section
+	initialised bool
 }
 
 type section struct {
@@ -31,232 +28,278 @@ type section struct {
 	end   int
 }
 
-// assign section helper function from before
-// helper func to assign sections of image to workers based on no. of threads
 func assignSections(height, workers int) []section {
-
-	// we need to calculate the minimum number of rows for each worker
 	minRows := height / workers
-	// then say if we have extra rows left over then we need to assign those evenly to each worker
-	extraRows := height % workers
+	extra := height % workers
 
-	// make a slice, the size of the number of threads
 	sections := make([]section, workers)
 	start := 0
 
 	for i := 0; i < workers; i++ {
-		// assigns the base amount of rows to the thread
 		rows := minRows
-		// if say we're on worker 2 and there are 3 extra rows left,
-		// then we can add 1 more job to the thread
-		if i < extraRows {
+		if i < extra {
 			rows++
 		}
 
-		// marks where the end of the section ends
 		end := start + rows
-		// assigns these rows to the section
-		sections[i] = section{start: start, end: end}
-		// start is updated for the next worker
+		sections[i] = section{start, end}
 		start = end
-	}
-
-	//DEBUG
-	fmt.Println("[BROKER] assignSections result:")
-	for i, s := range sections {
-		fmt.Printf("  worker %d: [%d,%d) (height %d)\n", i, s.start, s.end, s.end-s.start)
 	}
 
 	return sections
 }
 
-// function to count the number of alive cells
 func countAlive(world [][]byte) int {
-	count := 0
+	c := 0
 	for y := range world {
 		for x := range world[y] {
 			if world[y][x] == 255 {
-				count++
+				c++
 			}
 		}
 	}
-
-	return count
+	return c
 }
 
-// one iteration of the game using all workers
-
-//ProcessSection is called by the distributor once per turn
-/*
-In OG implementation, this function re-sent the entire world to every worker on every iteration, and each worker returned an updated slice.
-Every worker on every iteration, and each worker returned an updated slice.
-This matches the "easy" baseline in the coursework but has heavy communication overhead
-
-In halo exchange version, we change the behaviour:
-- On the first call, we split the world into sections and send each worker only its own slice plus the addresses of its neighbour workers
-- Workers keep this slice and manage halo rows internally
-- On every call (including the first after initialisation), we ask each worker to perform a single step (halo exchange + local update) and return its updated slice
-- we then stitch the full world together again for the distributor and/or tests
-
-*/
+// =====================================================================
+// PROCESS SECTION
+// =====================================================================
 
 func (broker *Broker) ProcessSection(req gol.BrokerRequest, res *gol.BrokerResponse) error {
-	p := req.Params
-	world := req.World
 
+	p := req.Params
 	numWorkers := len(broker.workerAddresses)
+
 	if numWorkers == 0 {
 		return fmt.Errorf("no workers registered")
 	}
 
-	// Snapshot current params/initialised under read lock so we can decide
-	// if we need to (re)initialise workers for this request.
-	broker.mu.RLock()
-	prevParams := broker.params
-	wasInitialised := broker.initialised
-	broker.mu.RUnlock()
-
-	needInit := !wasInitialised ||
-		p.ImageWidth != prevParams.ImageWidth ||
-		p.ImageHeight != prevParams.ImageHeight ||
-		p.Turns != prevParams.Turns ||
-		p.Threads != prevParams.Threads
-
-	// ---------------------------------------------------------------------
-	// (Re)initialise workers if needed
-	// ---------------------------------------------------------------------
-	if needInit {
-		sections := assignSections(p.ImageHeight, numWorkers)
-
-		// Build local slices for each worker *without* holding the lock
-		workerLocalWorlds := make([][][]byte, numWorkers)
-		for i, sec := range sections {
-			localHeight := sec.end - sec.start
-			localWorld := make([][]byte, localHeight)
-			for row := 0; row < localHeight; row++ {
-				localWorld[row] = make([]byte, p.ImageWidth)
-				copy(localWorld[row], world[sec.start+row])
-			}
-			workerLocalWorlds[i] = localWorld
+	// =====================================================================
+	// SPECIAL CASE: EXACTLY 1 WORKER → sequential GOL
+	// =====================================================================
+	if numWorkers == 1 {
+		if req.World == nil {
+			return fmt.Errorf("missing initial world for sequential mode")
 		}
 
-		// Perform InitSection RPCs (this can block, so no lock here)
-		for i, address := range broker.workerAddresses {
-			sec := sections[i]
-			localWorld := workerLocalWorlds[i]
+		world := req.World
+		H := p.ImageHeight
+		W := p.ImageWidth
 
-			// ring neighbours (single worker -> self-neighbour)
-			var aboveAddr, belowAddr string
-			if numWorkers == 1 {
-				aboveAddr = address
-				belowAddr = address
-			} else {
-				aboveAddr = broker.workerAddresses[(i-1+numWorkers)%numWorkers]
-				belowAddr = broker.workerAddresses[(i+1)%numWorkers]
+		next := make([][]byte, H)
+		for y := 0; y < H; y++ {
+			next[y] = make([]byte, W)
+		}
+
+		for y := 0; y < H; y++ {
+			up := (y - 1 + H) % H
+			down := (y + 1) % H
+			for x := 0; x < W; x++ {
+				left := (x - 1 + W) % W
+				right := (x + 1) % W
+
+				count := 0
+				if world[y][left] == 255 {
+					count++
+				}
+				if world[y][right] == 255 {
+					count++
+				}
+				if world[up][x] == 255 {
+					count++
+				}
+				if world[down][x] == 255 {
+					count++
+				}
+				if world[up][left] == 255 {
+					count++
+				}
+				if world[up][right] == 255 {
+					count++
+				}
+				if world[down][left] == 255 {
+					count++
+				}
+				if world[down][right] == 255 {
+					count++
+				}
+
+				if world[y][x] == 255 {
+					if count == 2 || count == 3 {
+						next[y][x] = 255
+					} else {
+						next[y][x] = 0
+					}
+				} else {
+					if count == 3 {
+						next[y][x] = 255
+					} else {
+						next[y][x] = 0
+					}
+				}
 			}
+		}
+
+		broker.mu.Lock()
+		broker.turn++
+		broker.alive = countAlive(next)
+		broker.mu.Unlock()
+
+		res.World = next
+		return nil
+	}
+
+	// =====================================================================
+	// MULTI-WORKER CASE (HALO MODE)
+	// =====================================================================
+
+	broker.mu.RLock()
+	wasInit := broker.initialised
+	prev := broker.params
+	broker.mu.RUnlock()
+
+	needInit := !wasInit ||
+		p.ImageWidth != prev.ImageWidth ||
+		p.ImageHeight != prev.ImageHeight ||
+		len(broker.sections) != numWorkers
+
+	if needInit {
+		initialWorld := req.World
+		H := p.ImageHeight
+
+		sections := assignSections(H, numWorkers)
+
+		// map global row -> worker owner
+		owner := make([]int, H)
+		for i, sec := range sections {
+			for r := sec.start; r < sec.end; r++ {
+				owner[r] = i
+			}
+		}
+
+		// SEND INITIAL SLICES
+		for i, addr := range broker.workerAddresses {
+
+			sec := sections[i]
+			localH := sec.end - sec.start
+
+			localSlice := make([][]byte, localH)
+			for r := 0; r < localH; r++ {
+				rowIdx := sec.start + r
+				localSlice[r] = append([]byte(nil), initialWorld[rowIdx]...)
+			}
+
+			// GLOBAL halo rows
+			topRowIdx := (sec.start - 1 + H) % H
+			botRowIdx := (sec.end) % H
+
+			topInitial := append([]byte(nil), initialWorld[topRowIdx]...)
+			bottomInitial := append([]byte(nil), initialWorld[botRowIdx]...)
+
+			// Find the ACTUAL neighbouring workers based on GLOBAL ROW order
+			aboveWorker := owner[topRowIdx]
+			belowWorker := owner[botRowIdx]
 
 			initReq := gol.WorkerInitRequest{
-				Params:     p,
-				StartY:     sec.start,
-				EndY:       sec.end,
-				LocalWorld: localWorld,
-				AboveAddr:  aboveAddr,
-				BelowAddr:  belowAddr,
+				Params:        p,
+				StartY:        sec.start,
+				EndY:          sec.end,
+				LocalWorld:    localSlice,
+				AboveAddr:     broker.workerAddresses[aboveWorker],
+				BelowAddr:     broker.workerAddresses[belowWorker],
+				TopInitial:    topInitial,
+				BottomInitial: bottomInitial,
 			}
 
-			client, err := rpc.Dial("tcp", address)
+			client, err := rpc.Dial("tcp", addr)
 			if err != nil {
-				return fmt.Errorf("error dialing worker %s for InitSection: %w", address, err)
+				return err
 			}
-
-			var reply struct{}
-			if err := client.Call("GOLWorker.InitSection", initReq, &reply); err != nil {
-				client.Close()
-				return fmt.Errorf("InitSection RPC failed for worker %s: %w", address, err)
-			}
+			client.Call("GOLWorker.InitSection", initReq, nil)
 			client.Close()
 		}
 
-		// 🔐 Only now, once all InitSection RPCs succeeded, update shared state
 		broker.mu.Lock()
-		broker.params = p
 		broker.sections = sections
+		broker.params = p
 		broker.initialised = true
 		broker.turn = 0
-		broker.alive = countAlive(world)
+		broker.alive = countAlive(initialWorld)
 		broker.mu.Unlock()
 	}
 
-	// ---------------------------------------------------------------------
-	// Step: ask each worker to perform one halo-exchange step
-	// ---------------------------------------------------------------------
+	// =====================================================================
+	// STEP PHASE
+	// =====================================================================
 
-	// Take a snapshot of sections/params under read lock
 	broker.mu.RLock()
 	sections := broker.sections
 	params := broker.params
 	broker.mu.RUnlock()
 
-	type sectionResult struct {
+	type result struct {
 		start int
 		rows  [][]byte
 		err   error
 	}
 
-	resultsChan := make(chan sectionResult, numWorkers)
+	ch := make(chan result, numWorkers)
 
-	for i, address := range broker.workerAddresses {
+	for i, addr := range broker.workerAddresses {
 		sec := sections[i]
-		address := address
 
-		go func(sec section, address string) {
-			client, err := rpc.Dial("tcp", address)
+		go func(sec section, addr string) {
+			client, err := rpc.Dial("tcp", addr)
 			if err != nil {
-				resultsChan <- sectionResult{err: fmt.Errorf("dial %s for Step: %w", address, err)}
+				ch <- result{err: err}
 				return
 			}
 			defer client.Close()
 
-			var stepReq struct{}
-			var stepRes gol.SectionResponse
+			var q struct{}
+			var resp gol.SectionResponse
 
-			if err := client.Call("GOLWorker.Step", stepReq, &stepRes); err != nil {
-				resultsChan <- sectionResult{err: fmt.Errorf("Step RPC %s: %w", address, err)}
+			if err := client.Call("GOLWorker.Step", q, &resp); err != nil {
+				ch <- result{err: err}
 				return
 			}
 
-			resultsChan <- sectionResult{
-				start: stepRes.StartY,
-				rows:  stepRes.Section,
-				err:   nil,
-			}
-		}(sec, address)
+			ch <- result{start: resp.StartY, rows: resp.Section}
+		}(sec, addr)
 	}
 
-	results := make([]sectionResult, numWorkers)
+	// collect results
+	//results := make([]result, numWorkers)
+	//for i := 0; i < numWorkers; i++ {
+	//	r := <-ch
+	//	if r.err != nil {
+	//		return r.err
+	//	}
+	//	results[i] = r
+	//}
+
+	results := make([]result, 0, numWorkers)
 	for i := 0; i < numWorkers; i++ {
-		r := <-resultsChan
+		r := <-ch
 		if r.err != nil {
 			return r.err
 		}
-		results[i] = r
+		results = append(results, r)
 	}
-	close(resultsChan)
 
-	// Stitch full world
+	// SORT results by global start row
+	sort.Slice(results, func(i, j int) bool {
+		return results[i].start < results[j].start
+	})
+
+	// stitch world
 	newWorld := make([][]byte, params.ImageHeight)
 	for _, r := range results {
 		for i, row := range r.rows {
-			y := r.start + i
-			newWorld[y] = row
+			newWorld[r.start+i] = row
 		}
 	}
 
-	// DEBUG
-	golden := debugSequentialStep(params, req.World)
-	debugCompareWorlds(broker.turn+1, newWorld, golden)
-
-	// Update turn + alive under lock so GetAliveCount sees a consistent snapshot
 	broker.mu.Lock()
 	broker.turn++
 	broker.alive = countAlive(newWorld)
@@ -266,8 +309,6 @@ func (broker *Broker) ProcessSection(req gol.BrokerRequest, res *gol.BrokerRespo
 	return nil
 }
 
-// allows distributor to request the current count from the broker
-// broker has access to the most recent number of alive cells in the world
 func (broker *Broker) GetAliveCount(_ struct{}, out *int) error {
 	broker.mu.RLock()
 	*out = broker.alive
@@ -275,17 +316,10 @@ func (broker *Broker) GetAliveCount(_ struct{}, out *int) error {
 	return nil
 }
 
-// We need a function that when q (quit) is pressed then the controller
-// exit without killing the simulation
-// when q is pressed we need to save the current board (pgm), then call a function that
-// doesnt persist the world -> basically do nothing
 func (broker *Broker) ControllerExit(_ gol.Empty, _ *gol.Empty) error {
 	return nil
 }
 
-// when k is pressed, we need to call a function that would send GOL.Shutdown
-// to each worker and then kill itself
-// then the controller saves the final image and exits
 func (broker *Broker) KillWorkers(_ gol.Empty, _ *gol.Empty) error {
 	for _, address := range broker.workerAddresses {
 		if c, err := rpc.Dial("tcp", address); err == nil {
@@ -293,154 +327,31 @@ func (broker *Broker) KillWorkers(_ gol.Empty, _ *gol.Empty) error {
 			_ = c.Close()
 		}
 	}
-
 	go os.Exit(0)
-
 	return nil
 }
 
-// debugSequentialStep computes the next world state using the original
-// full-world GoL rules (no distribution, no halos). We use this to
-// check that the distributed halo version is behaving identically.
-func debugSequentialStep(p gol.Params, world [][]byte) [][]byte {
-	h := p.ImageHeight
-	w := p.ImageWidth
-
-	next := make([][]byte, h)
-	for y := 0; y < h; y++ {
-		next[y] = make([]byte, w)
-	}
-
-	for i := 0; i < h; i++ {
-		for j := 0; j < w; j++ {
-			count := 0
-
-			up := (i - 1 + h) % h
-			down := (i + 1) % h
-			left := (j - 1 + w) % w
-			right := (j + 1) % w
-
-			if world[i][left] == 255 {
-				count++
-			}
-			if world[i][right] == 255 {
-				count++
-			}
-			if world[up][j] == 255 {
-				count++
-			}
-			if world[down][j] == 255 {
-				count++
-			}
-			if world[up][right] == 255 {
-				count++
-			}
-			if world[up][left] == 255 {
-				count++
-			}
-			if world[down][right] == 255 {
-				count++
-			}
-			if world[down][left] == 255 {
-				count++
-			}
-
-			if world[i][j] == 255 {
-				if count == 2 || count == 3 {
-					next[i][j] = 255
-				} else {
-					next[i][j] = 0
-				}
-			} else {
-				if count == 3 {
-					next[i][j] = 255
-				} else {
-					next[i][j] = 0
-				}
-			}
-		}
-	}
-
-	return next
-}
-
-// DEBUGGING
-// helper to print a row as 0/1 for easier debugging
-func rowBits(row []byte) string {
-	s := make([]byte, len(row))
-	for i, v := range row {
-		if v == 255 {
-			s[i] = '1'
-		} else {
-			s[i] = '0'
-		}
-	}
-	return string(s)
-}
-
-func debugCompareWorlds(turn int, dist, seq [][]byte) {
-	h := len(dist)
-	if h == 0 {
-		fmt.Printf("[DEBUG] empty worlds at turn %d\n", turn)
-		return
-	}
-	w := len(dist[0])
-
-	for y := 0; y < h; y++ {
-		if len(dist[y]) != len(seq[y]) {
-			fmt.Printf("[DEBUG] world mismatch at turn %d: row %d length %d vs %d\n",
-				turn, y, len(dist[y]), len(seq[y]))
-			return
-		}
-		for x := 0; x < w; x++ {
-			if dist[y][x] != seq[y][x] {
-				fmt.Printf("[DEBUG] first cell mismatch at turn %d: (x=%d,y=%d) dist=%d seq=%d\n",
-					turn, x, y, dist[y][x], seq[y][x])
-
-				yUp := (y - 1 + h) % h
-				yDown := (y + 1) % h
-
-				fmt.Printf("[DEBUG] dist row y-1=%d: %s\n", yUp, rowBits(dist[yUp]))
-				fmt.Printf("[DEBUG] dist row y  =%d: %s\n", y, rowBits(dist[y]))
-				fmt.Printf("[DEBUG] dist row y+1=%d: %s\n", yDown, rowBits(dist[yDown]))
-
-				fmt.Printf("[DEBUG] seq  row y-1=%d: %s\n", yUp, rowBits(seq[yUp]))
-				fmt.Printf("[DEBUG] seq  row y  =%d: %s\n", y, rowBits(seq[y]))
-				fmt.Printf("[DEBUG] seq  row y+1=%d: %s\n", yDown, rowBits(seq[yDown]))
-
-				return
-			}
-		}
-	}
-}
-
 func main() {
-
 	broker := &Broker{
 		workerAddresses: []string{
-			// CAN ALWAYS CHANGE
-			"172.31.30.142:8030",
-			"172.31.30.21:8030",
+			"localhost:8030",
+			"localhost:8031",
 		},
 	}
 
-	err := rpc.RegisterName("Broker", broker)
-
-	if err != nil {
+	if err := rpc.RegisterName("Broker", broker); err != nil {
 		fmt.Println("Error registering RPC:", err)
 		os.Exit(1)
 		return
 	}
 
 	listener, err := net.Listen("tcp4", "0.0.0.0:8040")
-
 	if err != nil {
 		fmt.Println("Error starting listener:", err)
 		os.Exit(1)
 		return
 	}
-	fmt.Println("Broker listening on port 8040 (IPv4)...")
-
+	fmt.Println("Broker listening on port 8040")
 	defer listener.Close()
 
 	for {

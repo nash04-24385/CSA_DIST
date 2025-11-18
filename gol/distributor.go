@@ -21,8 +21,6 @@ type distributorChannels struct {
 // distributor divides the work between workers and interacts with other goroutines.
 func distributor(p Params, c distributorChannels, keypress <-chan rune) {
 
-	// TODO: Create a 2D slice to store the world.
-
 	filename := fmt.Sprintf("%dx%d", p.ImageWidth, p.ImageHeight)
 	c.ioCommand <- ioInput
 	c.ioFilename <- filename
@@ -61,7 +59,7 @@ func distributor(p Params, c distributorChannels, keypress <-chan rune) {
 			// Case runs every time the timer ticks (every 2 seconds)
 			case <-ticker.C:
 
-				// 1) Ask broker for its alive count
+				// Ask broker for its alive count
 				var brokerAlive int
 				err := client.Call("Broker.GetAliveCount", struct{}{}, &brokerAlive)
 				if err != nil {
@@ -69,7 +67,7 @@ func distributor(p Params, c distributorChannels, keypress <-chan rune) {
 					continue
 				}
 
-				// 2) Locally recompute alive cells from our current world
+				// Locally recompute alive cells from our current world
 				localAlive := 0
 				for y := 0; y < p.ImageHeight; y++ {
 					for x := 0; x < p.ImageWidth; x++ {
@@ -79,11 +77,11 @@ func distributor(p Params, c distributorChannels, keypress <-chan rune) {
 					}
 				}
 
-				// 3) Debug print: compare the two
+				// Debug print: compare the two
 				fmt.Printf("[DEBUG Alive] turn=%d localAlive=%d brokerAlive=%d\n",
 					turn, localAlive, brokerAlive)
 
-				// 4) Still send the event as before (using brokerAlive, or localAlive if you prefer)
+				// Still send the event as before (using brokerAlive, or localAlive if you prefer)
 				c.events <- AliveCellsCount{
 					CompletedTurns: turn,
 					CellsCount:     brokerAlive,
@@ -104,15 +102,6 @@ func distributor(p Params, c distributorChannels, keypress <-chan rune) {
 
 	c.events <- StateChange{turn, Executing}
 
-	// for each turn it needs to split up the jobs,
-	// such that there is one job from eahc section for each thread
-	// needs to gather the results and then put them together for the newstate of world
-	// TODO: Execute all turns of the Game of Life.
-
-	//----------------------------------------------------------------------------------------------------------//
-	//----------------------------------------------------------------------------------------------------------//
-
-	// variables for step 5
 	paused := false
 	quitting := false
 
@@ -157,7 +146,7 @@ func distributor(p Params, c distributorChannels, keypress <-chan rune) {
 		default:
 		}
 
-		// quit if acc finished and not paused
+	
 		if quitting || (turn >= p.Turns && !paused) {
 			break
 		}
@@ -181,35 +170,6 @@ func distributor(p Params, c distributorChannels, keypress <-chan rune) {
 			continue
 		}
 
-		//// DEBUG: basic dims
-		//if len(world) > 0 {
-		//	fmt.Println("[DIST] old world dims:   ", len(world), len(world[0]))
-		//} else {
-		//	fmt.Println("[DIST] old world is empty")
-		//}
-		//
-		//if len(response.World) > 0 && response.World[0] != nil {
-		//	fmt.Println("[DIST] response dims:    ", len(response.World), len(response.World[0]))
-		//} else {
-		//	fmt.Println("[DIST] response world is empty or first row nil")
-		//}
-		//
-		//// DEBUG: check EVERY row length in response.World
-		//for y, row := range response.World {
-		//	if row == nil {
-		//		fmt.Println("[DIST] response row", y, "is nil")
-		//		continue
-		//	}
-		//	if len(row) != p.ImageWidth {
-		//		fmt.Printf("[DIST] BAD ROW LENGTH at y=%d len=%d expected=%d\n",
-		//			y, len(row), p.ImageWidth)
-		//	}
-		//}
-
-		///// STEP 6 CELLS FLIPPED///////////
-		// At the end of each turn, put all changed coordinates into a slice,
-		// and then send CellsFlipped event
-		// make a slice so as to compare the old row and the new row of the world
 		flippedCells := make([]util.Cell, 0)
 		// go row by row, then column by column
 		for y := 0; y < p.ImageHeight; y++ {
@@ -220,8 +180,7 @@ func distributor(p Params, c distributorChannels, keypress <-chan rune) {
 			}
 		}
 
-		// if there is at least one cell thats been flipped then we need to return the
-		// Cells Flipped event
+		// if there is at least one cell thats been flipped then we need to return the Cells Flipped event
 		if len(flippedCells) > 0 {
 			c.events <- CellsFlipped{
 				CompletedTurns: turn + 1,
@@ -230,20 +189,20 @@ func distributor(p Params, c distributorChannels, keypress <-chan rune) {
 
 		world = response.World
 
-		///// STEP 6 TURN COMPLETE///////////
+		
 		// At the end of each turn we need to signal that a turn is completed
 		c.events <- TurnComplete{
 			CompletedTurns: turn + 1,
 		}
 
-		turn++ //advance turn
+		turn++ 
 	}
 
 	//Stop ticker after finishing all turns
 	done <- true
 	ticker.Stop()
 
-	// TODO: Report the final state using FinalTurnCompleteEvent.
+	
 	aliveCells := AliveCells(world, p.ImageWidth, p.ImageHeight)
 	c.events <- FinalTurnComplete{CompletedTurns: turn, Alive: aliveCells}
 
@@ -270,25 +229,20 @@ func AliveCells(world [][]byte, width, height int) []util.Cell {
 
 // helper function to handle image saves
 func saveImage(p Params, c distributorChannels, world [][]byte, turn int) {
-	// Write final world to output file (PGM)
-	// Construct the output filename in the required format
-	// Example: "512x512x100" for a 512x512 world after 100 turns
 	outFileName := fmt.Sprintf("%dx%dx%d", p.ImageWidth, p.ImageHeight, turn)
-	c.ioCommand <- ioOutput     // telling the i/o goroutine that we are starting an output operation
-	c.ioFilename <- outFileName // sending the filename to io goroutine
+	c.ioCommand <- ioOutput    	c.ioFilename <- outFileName 
 
 	for y := 0; y < p.ImageHeight; y++ {
 		for x := 0; x < p.ImageWidth; x++ {
-			//writing the pixel value to the ioOutput channel
-			c.ioOutput <- world[y][x] //grayscale value for that pixel (0 or 255)
+			
+			c.ioOutput <- world[y][x] 
 		}
 	}
 
-	// Make sure that the Io has finished any output before exiting.
+
 	c.ioCommand <- ioCheckIdle
 	<-c.ioIdle
 
-	// once saved, notify the SDL event system (important for Step 5)
 	c.events <- ImageOutputComplete{CompletedTurns: turn, Filename: outFileName}
 
 }

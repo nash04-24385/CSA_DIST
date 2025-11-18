@@ -10,8 +10,6 @@ import (
 	"uk.ac.bris.cs/gameoflife/gol"
 )
 
-// the broker will keep track of the multiple GOLWorkers
-// can use to tell us how many workers we have and then split up the image based on that
 type Broker struct {
 	workerAddresses []string
 	turn            int
@@ -20,7 +18,6 @@ type Broker struct {
 	mu sync.RWMutex
 
 	//Added new fields for the halo-exchange implementation
-
 	params      gol.Params // params stores the last Params used to initialise the workers
 	sections    []section  // sections remembers which global row range each worker owns
 	initialised bool       // tells us whether we've already sent initial slices to workers
@@ -31,33 +28,26 @@ type section struct {
 	end   int
 }
 
-// assign section helper function from before
+
 // helper func to assign sections of image to workers based on no. of threads
 func assignSections(height, workers int) []section {
 
-	// we need to calculate the minimum number of rows for each worker
 	minRows := height / workers
-	// then say if we have extra rows left over then we need to assign those evenly to each worker
 	extraRows := height % workers
 
-	// make a slice, the size of the number of threads
 	sections := make([]section, workers)
 	start := 0
 
 	for i := 0; i < workers; i++ {
-		// assigns the base amount of rows to the thread
+	
 		rows := minRows
-		// if say we're on worker 2 and there are 3 extra rows left,
-		// then we can add 1 more job to the thread
 		if i < extraRows {
 			rows++
 		}
 
-		// marks where the end of the section ends
+		
 		end := start + rows
-		// assigns these rows to the section
 		sections[i] = section{start: start, end: end}
-		// start is updated for the next worker
 		start = end
 	}
 	return sections
@@ -77,7 +67,7 @@ func countAlive(world [][]byte) int {
 	return count
 }
 
-// one iteration of the game using all workers
+
 
 //ProcessSection is called by the distributor once per turn
 /*
@@ -103,8 +93,7 @@ func (broker *Broker) ProcessSection(req gol.BrokerRequest, res *gol.BrokerRespo
 		return fmt.Errorf("no workers registered")
 	}
 
-	// Snapshot current params/initialised under read lock so we can decide
-	// if we need to (re)initialise workers for this request.
+	// Snapshot current params/initialised under read lock so we can decide if we need to (re)initialise workers for this request.
 	broker.mu.RLock()
 	prevParams := broker.params
 	wasInitialised := broker.initialised
@@ -116,9 +105,7 @@ func (broker *Broker) ProcessSection(req gol.BrokerRequest, res *gol.BrokerRespo
 		p.Turns != prevParams.Turns ||
 		p.Threads != prevParams.Threads
 
-	// ---------------------------------------------------------------------
-	// (Re)initialise workers if needed
-	// ---------------------------------------------------------------------
+	
 	if needInit {
 		sections := assignSections(p.ImageHeight, numWorkers)
 
@@ -171,7 +158,7 @@ func (broker *Broker) ProcessSection(req gol.BrokerRequest, res *gol.BrokerRespo
 			client.Close()
 		}
 
-		// 🔐 Only now, once all InitSection RPCs succeeded, update shared state
+	
 		broker.mu.Lock()
 		broker.params = p
 		broker.sections = sections
@@ -181,9 +168,6 @@ func (broker *Broker) ProcessSection(req gol.BrokerRequest, res *gol.BrokerRespo
 		broker.mu.Unlock()
 	}
 
-	// ---------------------------------------------------------------------
-	// Step: ask each worker to perform one halo-exchange step
-	// ---------------------------------------------------------------------
 
 	// Take a snapshot of sections/params under read lock
 	broker.mu.RLock()
@@ -253,7 +237,7 @@ func (broker *Broker) ProcessSection(req gol.BrokerRequest, res *gol.BrokerRespo
 		}
 	}
 
-	// 🔐 Update turn + alive under lock so GetAliveCount sees a consistent snapshot
+	// Update turn + alive under lock so GetAliveCount sees a consistent snapshot
 	broker.mu.Lock()
 	broker.turn++
 	broker.alive = countAlive(newWorld)

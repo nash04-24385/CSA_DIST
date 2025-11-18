@@ -32,11 +32,7 @@ type GOLWorker struct {
 	belowAddr string
 }
 
-// process the section the broker gives
 
-// -----------------------------------------------------------------------------
-// Baseline method (current implementation) - still here if you need it
-// -----------------------------------------------------------------------------
 
 // process the section the broker gives (baseline, full-world resync)
 func (w *GOLWorker) ProcessSection(req gol.SectionRequest, res *gol.SectionResponse) error {
@@ -54,13 +50,10 @@ func (w *GOLWorker) ProcessSection(req gol.SectionRequest, res *gol.SectionRespo
 	return nil
 }
 
-// -----------------------------------------------------------------------------
-// New: Initialisation for halo-exchange mode
-// -----------------------------------------------------------------------------
 
-// InitSection is called once by the broker to give this worker its slice
-// and neighbour addresses.
-func (w *GOLWorker) InitSection(req gol.WorkerInitRequest, _ *struct{}) error {
+// Initialisation for halo-exchange mode
+// InitialiseWorker is called once by the broker to give this worker its slice and neighbour addresses.
+func (w *GOLWorker) InitialiseWorker(req gol.WorkerInitRequest, _ *struct{}) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
@@ -88,10 +81,8 @@ func (w *GOLWorker) InitSection(req gol.WorkerInitRequest, _ *struct{}) error {
 	return nil
 }
 
-// -----------------------------------------------------------------------------
-// New: Halo receiver RPCs (neighbours call these)
-// -----------------------------------------------------------------------------
 
+// Halo receiver RPCs (neighbours call these)
 func (w *GOLWorker) SetTopHalo(req gol.HaloRow, _ *struct{}) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -116,21 +107,17 @@ func (w *GOLWorker) SetBottomHalo(req gol.HaloRow, _ *struct{}) error {
 	return nil
 }
 
-// -----------------------------------------------------------------------------
-// New: Single "Step" for one Game of Life iteration using halos
-// -----------------------------------------------------------------------------
-
-// Step performs one GoL iteration:
+// ProcessHaloTurn performs one GoL iteration:
 //  1. Send our boundary rows to neighbours (halo exchange).
 //  2. Wait for neighbours to update our halo rows via SetTopHalo/SetBottomHalo.
 //  3. Compute next local slice using localWorld + halos.
 //  4. Return updated slice to broker.
-func (w *GOLWorker) Step(_ struct{}, res *gol.SectionResponse) error {
-	// 1. Capture current boundaries + neighbour addresses under read lock
+func (w *GOLWorker) ProcessHaloTurn(_ struct{}, res *gol.SectionResponse) error {
+	// Capture current boundaries + neighbour addresses under read lock
 	w.mu.RLock()
 	if w.localWorld == nil {
 		w.mu.RUnlock()
-		return fmt.Errorf("Step called before InitSection")
+		return fmt.Errorf("ProcessHaloTurn called before InitialiseWorker")
 	}
 
 	height := len(w.localWorld)
@@ -147,7 +134,7 @@ func (w *GOLWorker) Step(_ struct{}, res *gol.SectionResponse) error {
 	params := w.params
 	w.mu.RUnlock()
 
-	// 2. Send our boundaries to neighbours (if they exist)
+	// Send our boundaries to neighbours (if they exist)
 	var wg sync.WaitGroup
 
 	if aboveAddr != "" {
@@ -156,7 +143,7 @@ func (w *GOLWorker) Step(_ struct{}, res *gol.SectionResponse) error {
 			defer wg.Done()
 			client, err := rpc.Dial("tcp", addr)
 			if err != nil {
-				fmt.Println("Step: failed to dial above neighbour:", err)
+				fmt.Println("ProcessHaloTurn: failed to dial above neighbour:", err)
 				return
 			}
 			defer client.Close()
@@ -164,7 +151,7 @@ func (w *GOLWorker) Step(_ struct{}, res *gol.SectionResponse) error {
 			req := gol.HaloRow{Row: row}
 			var reply struct{}
 			if err := client.Call("GOLWorker.SetBottomHalo", req, &reply); err != nil {
-				fmt.Println("Step: SetBottomHalo RPC failed:", err)
+				fmt.Println("ProcessHaloTurn: SetBottomHalo RPC failed:", err)
 			}
 		}(aboveAddr, topBoundary)
 	}
@@ -175,7 +162,7 @@ func (w *GOLWorker) Step(_ struct{}, res *gol.SectionResponse) error {
 			defer wg.Done()
 			client, err := rpc.Dial("tcp", addr)
 			if err != nil {
-				fmt.Println("Step: failed to dial below neighbour:", err)
+				fmt.Println("ProcessHaloTurn: failed to dial below neighbour:", err)
 				return
 			}
 			defer client.Close()
@@ -183,14 +170,14 @@ func (w *GOLWorker) Step(_ struct{}, res *gol.SectionResponse) error {
 			req := gol.HaloRow{Row: row}
 			var reply struct{}
 			if err := client.Call("GOLWorker.SetTopHalo", req, &reply); err != nil {
-				fmt.Println("Step: SetTopHalo RPC failed:", err)
+				fmt.Println("ProcessHaloTurn: SetTopHalo RPC failed:", err)
 			}
 		}(belowAddr, bottomBoundary)
 	}
 
 	wg.Wait()
 
-	// 3. Now that our halos should be set, compute next local slice
+	// Now that our halos should be set, compute next local slice
 	w.mu.Lock()
 	newLocal := calculateNextUsingHalos(params, w.localWorld, w.topHalo, w.bottomHalo)
 	w.localWorld = newLocal
@@ -209,11 +196,9 @@ func (w *GOLWorker) Step(_ struct{}, res *gol.SectionResponse) error {
 	return nil
 }
 
-// -----------------------------------------------------------------------------
-// GoL logic
-// -----------------------------------------------------------------------------
 
-// Baseline helper: uses full world (your original implementation)
+// GoL logic
+
 func calculateNextStatesFullWorld(p gol.Params, world [][]byte, startY, endY int) [][]byte {
 	h := p.ImageHeight
 	w := p.ImageWidth
@@ -273,7 +258,7 @@ func calculateNextStatesFullWorld(p gol.Params, world [][]byte, startY, endY int
 					newRows[i-startY][j] = 0
 				}
 
-			} else { // world[i][j] == 0
+			} else { 
 				if count == 3 {
 					newRows[i-startY][j] = 255
 				} else {
@@ -286,7 +271,7 @@ func calculateNextStatesFullWorld(p gol.Params, world [][]byte, startY, endY int
 	return newRows
 }
 
-// New helper: uses localWorld + halos instead of full world
+
 // localWorld has shape [hLocal][w], topHalo & bottomHalo are length w.
 func calculateNextUsingHalos(p gol.Params, localWorld [][]byte, topHalo, bottomHalo []byte) [][]byte {
 	hLocal := len(localWorld)
@@ -367,10 +352,6 @@ func calculateNextUsingHalos(p gol.Params, localWorld [][]byte, topHalo, bottomH
 
 	return newLocal
 }
-
-// -----------------------------------------------------------------------------
-// Shutdown + main unchanged
-// -----------------------------------------------------------------------------
 
 // helper func to make worker shut down on keypress
 func (w *GOLWorker) Shutdown(_ struct{}, _ *struct{}) error {

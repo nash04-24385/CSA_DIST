@@ -60,18 +60,33 @@ func distributor(p Params, c distributorChannels, keypress <-chan rune) {
 			select {
 			// Case runs every time the timer ticks (every 2 seconds)
 			case <-ticker.C:
-				var aliveCount int
 
-				err := client.Call("Broker.GetAliveCount", struct{}{}, &aliveCount)
-
+				// 1) Ask broker for its alive count
+				var brokerAlive int
+				err := client.Call("Broker.GetAliveCount", struct{}{}, &brokerAlive)
 				if err != nil {
 					fmt.Println("Error calling GetAliveCount:", err)
 					continue
 				}
 
+				// 2) Locally recompute alive cells from our current world
+				localAlive := 0
+				for y := 0; y < p.ImageHeight; y++ {
+					for x := 0; x < p.ImageWidth; x++ {
+						if world[y][x] == 255 {
+							localAlive++
+						}
+					}
+				}
+
+				// 3) Debug print: compare the two
+				fmt.Printf("[DEBUG Alive] turn=%d localAlive=%d brokerAlive=%d\n",
+					turn, localAlive, brokerAlive)
+
+				// 4) Still send the event as before (using brokerAlive, or localAlive if you prefer)
 				c.events <- AliveCellsCount{
 					CompletedTurns: turn,
-					CellsCount:     aliveCount,
+					CellsCount:     brokerAlive,
 				}
 			case <-done:
 				return
@@ -165,6 +180,31 @@ func distributor(p Params, c distributorChannels, keypress <-chan rune) {
 			quitting = true
 			continue
 		}
+
+		//// DEBUG: basic dims
+		//if len(world) > 0 {
+		//	fmt.Println("[DIST] old world dims:   ", len(world), len(world[0]))
+		//} else {
+		//	fmt.Println("[DIST] old world is empty")
+		//}
+		//
+		//if len(response.World) > 0 && response.World[0] != nil {
+		//	fmt.Println("[DIST] response dims:    ", len(response.World), len(response.World[0]))
+		//} else {
+		//	fmt.Println("[DIST] response world is empty or first row nil")
+		//}
+		//
+		//// DEBUG: check EVERY row length in response.World
+		//for y, row := range response.World {
+		//	if row == nil {
+		//		fmt.Println("[DIST] response row", y, "is nil")
+		//		continue
+		//	}
+		//	if len(row) != p.ImageWidth {
+		//		fmt.Printf("[DIST] BAD ROW LENGTH at y=%d len=%d expected=%d\n",
+		//			y, len(row), p.ImageWidth)
+		//	}
+		//}
 
 		///// STEP 6 CELLS FLIPPED///////////
 		// At the end of each turn, put all changed coordinates into a slice,
